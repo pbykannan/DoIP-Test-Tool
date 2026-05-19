@@ -1,0 +1,267 @@
+# 完整配置模板：可按项目需要裁剪；不写的字段将使用代码默认值
+network:
+  host: "172.168.2.30"
+  tcp_port: 13400
+  udp_port: 13400
+  client_bind_ip: null
+
+doip:
+  client_logical_address: 0x0E80
+  server_logical_address: 0x0001
+  protocol_version: 3
+  socket_read_timeout: 15
+  activation_type: "Default"
+  activation_disabled: false
+  vm_specific: 0
+  uds_addressing: "physical"
+  functional_logical_address: 0xE400
+
+uds:
+  request_timeout: 50
+  p2_timeout: 1
+  p2_star_timeout: 5
+  server_address_format: null
+  server_memorysize_format: null
+  # 0x27：level 0x01 / 0x11 对应两把 16 字节密钥（奇瑞参考示例，可按实车项目替换）
+  security_key_level1: "3D2E6DE2A12517BAC5B31BBD0E7E3B54"
+  security_key_level3: "D0DFAA1588E04B5B14CE834E65E621CD"
+
+diagnostics:
+  # 诊断树定义（仅用于 UI 左侧“服务树”，不参与 flash 流程）
+  # 来源：v116 doip_callback.c 中各服务回调 + switch/case 支持项
+  # 约束：
+  # 1) sid 必须从小到大
+  # 2) 每项 request 首字节必须等于 sid
+  # 3) UI 显示格式固定为：SID xx xx（注释）
+  service_presets:
+    - sid: 0x10
+      items:
+        - request: "1001"
+          comment: "默认会话"
+        - request: "1002"
+          comment: "编程会话"
+        - request: "1003"
+          comment: "扩展会话"
+    - sid: 0x11
+      items:
+        - request: "1101"
+          comment: "硬复位"
+    - sid: 0x14
+      items:
+        - request: "14FFFFFF"
+          comment: "清除全部 DTC"
+    - sid: 0x19
+      items:
+        - request: "1901FF"
+          comment: "按状态掩码读 DTC 数量"
+        - request: "1902FF"
+          comment: "按状态掩码读 DTC 列表"
+        - request: "1903"
+          comment: "读快照标识"
+        - request: "1904FFFFFF01"
+          comment: "按 DTC 读快照记录"
+        - request: "1906FFFFFF"
+          comment: "按 DTC 读扩展数据"
+        - request: "190A09"
+          comment: "读支持的 DTC"
+    - sid: 0x22
+      items:
+        - request: "224640"
+          comment: "整车电源状态"
+        - request: "224641"
+          comment: "总里程"
+        - request: "224642"
+          comment: "日期时间"
+        - request: "224643"
+          comment: "车速"
+        - request: "224644"
+          comment: "蓄电池电压"
+        - request: "224645"
+          comment: "SOC"
+        - request: "225800"
+          comment: "ICCID"
+        - request: "225802"
+          comment: "TBOX_SN"
+        - request: "225803"
+          comment: "密钥灌装状态"
+        - request: "22D008"
+          comment: "PIN"
+        - request: "22D009"
+          comment: "SK"
+        - request: "22D00A"
+          comment: "CC"
+        - request: "22F011"
+          comment: "整车配置"
+        - request: "22F013"
+          comment: "软件零件号"
+        - request: "22F089"
+          comment: "ECU 硬件版本"
+        - request: "22F160"
+          comment: "签名公钥状态"
+        - request: "22F180"
+          comment: "Boot 软件版本"
+        - request: "22F184"
+          comment: "应用软件指纹"
+        - request: "22F186"
+          comment: "当前诊断会话"
+        - request: "22F187"
+          comment: "整车厂定义零件号"
+        - request: "22F189"
+          comment: "ECU 软件版本"
+        - request: "22F18A"
+          comment: "供应商代码"
+        - request: "22F18C"
+          comment: "车辆识别号(扩展)"
+        - request: "22F190"
+          comment: "车辆识别号 VIN"
+        - request: "22F197"
+          comment: "系统名称"
+        - request: "22F0F1"
+          comment: "升级尝试计数"
+        - request: "22F0F3"
+          comment: "依赖检查成功计数"
+    - sid: 0x27
+      items:
+        - request: "2701"
+          comment: "请求 Seed(L1)"
+        - request: "2702"
+          comment: "发送 Key(L1)"
+        - request: "2711"
+          comment: "请求 Seed(L3)"
+        - request: "2712"
+          comment: "发送 Key(L3)"
+    - sid: 0x28
+      items:
+        - request: "280001"
+          comment: "恢复通信 NCM"
+        - request: "280003"
+          comment: "恢复通信 NWMCM+NCM"
+        - request: "280101"
+          comment: "开Rx关Tx NCM"
+        - request: "280103"
+          comment: "开Rx关Tx NWMCM+NCM"
+        - request: "280201"
+          comment: "关Rx开Tx NCM"
+        - request: "280203"
+          comment: "关Rx开Tx NWMCM+NCM"
+        - request: "280301"
+          comment: "关Rx关Tx NCM"
+        - request: "280303"
+          comment: "关Rx关Tx NWMCM+NCM"
+        - request: "288001"
+          comment: "恢复通信 NCM(抑制)"
+        - request: "288003"
+          comment: "恢复通信 NWMCM+NCM(抑制)"
+        - request: "288101"
+          comment: "开Rx关Tx NCM(抑制)"
+        - request: "288103"
+          comment: "开Rx关Tx NWMCM+NCM(抑制)"
+        - request: "288201"
+          comment: "关Rx开Tx NCM(抑制)"
+        - request: "288203"
+          comment: "关Rx开Tx NWMCM+NCM(抑制)"
+        - request: "288301"
+          comment: "关Rx关Tx NCM(抑制)"
+        - request: "288303"
+          comment: "关Rx关Tx NWMCM+NCM(抑制)"
+    - sid: 0x2E
+      items:
+        - request: "2ED008"
+          comment: "写 PIN（后续拼接数据）"
+        - request: "2ED009"
+          comment: "写 SK（后续拼接数据）"
+        - request: "2ED00A"
+          comment: "写 CC（后续拼接数据）"
+        - request: "2EF011"
+          comment: "写整车配置（后续拼接数据）"
+        - request: "2EF184"
+          comment: "写应用软件指纹（后续拼接数据）"
+        - request: "2EF190"
+          comment: "写 VIN（后续拼接数据）"
+    - sid: 0x31
+      items:
+        - request: "31010203"
+          comment: "前置例程 0x0203"
+        - request: "3101DD01"
+          comment: "保持在 Boot"
+        - request: "3101DD02"
+          comment: "验签例程 DD02（运行时会拼签名参数）"
+        - request: "3101DD03"
+          comment: "后处理 DD03"
+        - request: "3101FF00"
+          comment: "擦除内存 FF00"
+        - request: "3101FF01"
+          comment: "检查依赖 FF01"
+    - sid: 0x3E
+      items:
+        - request: "3E00"
+          comment: "TesterPresent"
+        - request: "3E80"
+          comment: "TesterPresent（抑制正响应）"
+    - sid: 0x85
+      items:
+        - request: "8501"
+          comment: "DTC Setting ON"
+        - request: "8502"
+          comment: "DTC Setting OFF"
+        - request: "8581"
+          comment: "DTC Setting ON（抑制正响应）"
+        - request: "8582"
+          comment: "DTC Setting OFF（抑制正响应）"
+
+flash:
+  # -----------------------------
+  # 以下是刷写流程配置（不会显示在诊断树）
+  # -----------------------------
+  memory_address: 134217728
+  address_format: 32
+  memorysize_format: 32
+  override_block_payload: null
+  transfer_exit_data: null
+  # Pre-programming
+  pre_transfer_raw_requests:
+    - "1001"
+    - payload: "1083"
+      addressing: functional
+    - "1003"
+    - "31010203"
+    - payload: "8582"
+      addressing: functional
+    - payload: "288303"
+      addressing: functional
+    - "22F189"
+  pre_transfer_routines: []
+  # Programming session
+  diagnostic_sessions_before_download:
+    - programming
+  # SecurityAccess（会在会话/前置步骤后执行 unlock_security_access(level)）
+  # 0x01 => 27 01/02, 0x11 => 27 11/12
+  security_access_levels_before_download:
+    - 0x01
+    - 0x11
+  # 2E F184 fingerprint（v116 固定 19 bytes）
+  fingerprint_did: 0xF184
+  fingerprint_data: "112233445566778899AABBCCDDEEFF00112233"
+  # Post-download routines
+  post_transfer_routines:
+    - routine_id: 0xFF01
+      control_type: 1
+      data: ""
+    - routine_id: 0xDD03
+      control_type: 1
+      data: ""
+  # Post-programming（HardReset 前：仍使用当前 TCP 会话）
+  post_transfer_raw_requests:
+    - payload: "288003"
+      addressing: functional
+    - "1101"
+  # HardReset (1101) 后等对端镜像/服务端升级就绪再起 TCP（实测可能数分钟量级）
+  post_transfer_reconnect_delay_sec: 350
+  # HardReset、重连后继续（扩展会话清理等）
+  post_transfer_after_reconnect_raw_requests:
+    - "1003"
+    - "14FFFFFF"
+    - payload: "8581"
+      addressing: functional
+    - payload: "1081"
+      addressing: functional

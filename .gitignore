@@ -1,0 +1,50 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments (never commit site-packages)
+.venv/
+venv/
+ENV/
+
+# Packaging / installers (regenerate from source)
+build/
+dist/
+*.spec.bak
+DoIP-Test.zip
+DoIPTester.spec
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Secrets & local overrides ---
+.env
+.env.*
+!.env.example
+secrets.yaml
+*_secret*.yaml
+*_local*.yaml
+
+# Root config.yaml is not read by the GUI (legacy); ignore local copies if present.
+config.yaml
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs / scratch ---
+*.log
+*.tmp
