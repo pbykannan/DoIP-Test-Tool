@@ -95,6 +95,8 @@ class FlashConfig:
     address_format: int = 32
     memorysize_format: int = 32
     override_block_payload: Optional[int] = None
+    # 34 正答后、首包 36 前等待（秒）；null 用代码默认 0.35s
+    post_request_download_delay_sec: Optional[float] = None
     transfer_exit_data: Optional[bytes] = None
     # 刷写前的原始 UDS 请求（hex），按顺序执行；可用于 10 83 / 85 82 / 28 83 等 OEM 步骤
     pre_transfer_raw_requests: List[RawRequestStep] = field(default_factory=list)
@@ -379,6 +381,11 @@ class AppConfig:
                 override_block_payload=(
                     int(fl["override_block_payload"])
                     if fl.get("override_block_payload") is not None
+                    else None
+                ),
+                post_request_download_delay_sec=(
+                    float(fl["post_request_download_delay_sec"])
+                    if fl.get("post_request_download_delay_sec") is not None
                     else None
                 ),
                 transfer_exit_data=exit_bytes,

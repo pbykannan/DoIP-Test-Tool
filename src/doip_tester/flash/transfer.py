@@ -94,6 +94,24 @@ _DID_WRITE_REQUIREMENT = {
 # TransferData 外：会话重申与安全访问之后由 _flash_tester_present_optional 再发 3E80，刷新 S3。
 # 固定 2s 节拍（仅 34/36 循环内）。
 _FLASH_KEEPALIVE_INTERVAL_SEC = 2.0
+# 34 正答后 ECU 常需准备下载缓冲区；立即发 36 易 TCP/无 76。YAML 未配时用此默认值。
+_POST_REQUEST_DOWNLOAD_DELAY_SEC = 0.35
+
+
+def _delay_after_request_download(
+    delay_sec: float, cancel: threading.Event, log: LogFn
+) -> None:
+    if delay_sec <= 0:
+        return
+    log("RequestDownload 后等待 %.2fs 再发 TransferData …" % delay_sec)
+    deadline = time.monotonic() + delay_sec
+    while True:
+        if cancel.is_set():
+            raise FlashAborted("cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
 
 
 def compute_transfer_payload_size(max_number_of_block_length: int) -> int:
@@ -642,6 +660,13 @@ def _transfer_one_file(
         "Using TransferData payload size=%d (ECU max_number_of_block_length=%d) file=%s"
         % (payload, max_len, item.name)
     )
+
+    rd_delay = fl.post_request_download_delay_sec
+    if rd_delay is None:
+        rd_delay = _POST_REQUEST_DOWNLOAD_DELAY_SEC
+    else:
+        rd_delay = float(rd_delay)
+    _delay_after_request_download(rd_delay, cancel, log)
 
     seq = 1
     offset = 0

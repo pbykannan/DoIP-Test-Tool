@@ -109,6 +109,10 @@ def app_config_to_dict(cfg: AppConfig) -> Dict[str, Any]:
     }
     if cfg.flash.override_block_payload is not None:
         flash["override_block_payload"] = cfg.flash.override_block_payload
+    if cfg.flash.post_request_download_delay_sec is not None:
+        flash["post_request_download_delay_sec"] = (
+            cfg.flash.post_request_download_delay_sec
+        )
     if cfg.flash.transfer_exit_data:
         flash["transfer_exit_data"] = cfg.flash.transfer_exit_data.hex()
     if cfg.flash.pre_transfer_raw_requests:

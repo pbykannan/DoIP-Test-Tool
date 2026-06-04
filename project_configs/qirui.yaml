@@ -22,9 +22,9 @@ uds:
   p2_star_timeout: 5
   server_address_format: null
   server_memorysize_format: null
-  # 0x27：level 0x01 / 0x11 对应两把 16 字节密钥（奇瑞参考示例，可按实车项目替换）
-  security_key_level1: "3D2E6DE2A12517BAC5B31BBD0E7E3B54"
-  security_key_level3: "D0DFAA1588E04B5B14CE834E65E621CD"
+  # 0x27：level 0x01 / 0x11 各 16 字节 AES-128-CMAC 密钥（TBOX 正式密钥 2024-04）
+  security_key_level1: "AB235823A5C6964796C412448AC3252E"
+  security_key_level3: "69E5CA4C3DBF5366F720094D883EC456"
 
 diagnostics:
   # 诊断树定义（仅用于 UI 左侧“服务树”，不参与 flash 流程）
@@ -217,6 +217,8 @@ flash:
   address_format: 32
   memorysize_format: 32
   override_block_payload: null
+  # 34 应答后稍等再发 36（秒）；仍异常可试 0.5～1.0
+  post_request_download_delay_sec: 0.35
   transfer_exit_data: null
   # Pre-programming
   pre_transfer_raw_requests:
