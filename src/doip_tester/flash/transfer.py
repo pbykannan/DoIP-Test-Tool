@@ -8,9 +8,8 @@
 - DOIP_UDS examples/main-client.c 的 `full`：ext → prog → security → 再 38/34 等。
 
 默认刷写前奏（配置里会话/解锁列表为空时自动采用）：
-**Extended(0x03) → pre_transfer_routines → Programming(0x02) → SecurityAccess L3（0x11）→ 0x34/36/37**。
-规范与对端逻辑：刷写仅使用编程安全级 L3，对应 ``unlock_security_access(0x11)`` 与 ``uds.security_key_level3``。
-仅在偏离默认时再在 YAML 中填写 ``flash.security_access_levels_before_download`` 等覆盖。
+**Extended(0x03) → pre_transfer_routines → Programming(0x02) → SecurityAccess L1(0x01) → L3(0x11) → 0x34/36/37**。
+对端要求从 lock 逐级解锁，**不可跳过 L1 直接 L3**；``flash.security_access_levels_before_download`` 若只写 ``0x11`` 也会自动补 ``0x01``。
 
 顺序：
 1. 第一个 extended；
@@ -69,7 +68,9 @@ TRANSFER_DATA_OVERHEAD = 2  # 0x36 + blockSequenceCounter per ISO-14229-1
 
 # 未在 YAML 中指定时使用（奇瑞等对端：03→02→27 L3→34）
 _DEFAULT_DIAGNOSTIC_SESSIONS_BEFORE_DOWNLOAD: List[str] = ["extended", "programming"]
-_DEFAULT_SECURITY_LEVELS_BEFORE_DOWNLOAD: List[int] = [0x11]  # 编程安全级 L3
+_DEFAULT_SECURITY_LEVELS_BEFORE_DOWNLOAD: List[int] = [0x01, 0x11]  # L1 → L3，不可直跳 L3
+_FLASH_SEC_L1 = 0x01
+_FLASH_SEC_L3 = 0x11
 
 # 对照 v116 config.xml：
 # - session index 0/1/2 = default/programming/extended
@@ -96,6 +97,8 @@ _DID_WRITE_REQUIREMENT = {
 _FLASH_KEEPALIVE_INTERVAL_SEC = 2.0
 # 34 正答后 ECU 常需准备下载缓冲区；立即发 36 易 TCP/无 76。YAML 未配时用此默认值。
 _POST_REQUEST_DOWNLOAD_DELAY_SEC = 0.35
+# L1(27 02 成功) 后 ECU 常需间隔再收 L3(27 11)；YAML 未配时用此默认值。
+_SECURITY_L1_TO_L3_DELAY_SEC = 0.35
 
 
 def _delay_after_request_download(
@@ -112,6 +115,31 @@ def _delay_after_request_download(
         if remaining <= 0:
             break
         time.sleep(min(0.05, remaining))
+
+
+def _delay_between_security_l1_and_l3(
+    delay_sec: float,
+    cancel: Optional[threading.Event],
+    log: LogFn,
+) -> None:
+    if delay_sec <= 0:
+        return
+    log("SecurityAccess L1 解锁后等待 %.2fs 再解 L3 …" % delay_sec)
+    deadline = time.monotonic() + delay_sec
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise FlashAborted("cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+
+
+def _resolve_l1_to_l3_delay_sec(fl) -> float:
+    v = getattr(fl, "security_l1_to_l3_delay_sec", None)
+    if v is None:
+        return _SECURITY_L1_TO_L3_DELAY_SEC
+    return float(v)
 
 
 def compute_transfer_payload_size(max_number_of_block_length: int) -> int:
@@ -240,16 +268,84 @@ def _ensure_programming_via_default_extended(
     _ensure_session(client, "programming", log, state)
 
 
-def _ensure_security_level(
+def _normalize_flash_security_levels(levels: Sequence[int]) -> List[int]:
+    """刷写 27：须 lock→L1→L3；含 L3 时保证 L1 在前且只出现一次。"""
+    if not levels:
+        return list(_DEFAULT_SECURITY_LEVELS_BEFORE_DOWNLOAD)
+    out: List[int] = []
+    seen: set[int] = set()
+    for raw in levels:
+        lvl = int(raw) & 0xFF
+        if lvl in seen:
+            continue
+        out.append(lvl)
+        seen.add(lvl)
+    if _FLASH_SEC_L3 in seen and _FLASH_SEC_L1 not in seen:
+        out.insert(out.index(_FLASH_SEC_L3), _FLASH_SEC_L1)
+    elif _FLASH_SEC_L3 in seen and _FLASH_SEC_L1 in seen:
+        if out.index(_FLASH_SEC_L1) > out.index(_FLASH_SEC_L3):
+            out.remove(_FLASH_SEC_L1)
+            out.insert(out.index(_FLASH_SEC_L3), _FLASH_SEC_L1)
+    return out
+
+
+def _unlock_security_level(
     client: Client, level: int, log: LogFn, state: FlashFlowState, reason: str
+) -> None:
+    lvl = int(level) & 0xFF
+    log("SecurityAccess: unlock level=0x%02X（%s）" % (lvl, reason))
+    client.unlock_security_access(lvl)
+    state.unlocked_levels.add(lvl)
+    state.active_security_level = lvl
+
+
+def _ensure_security_level(
+    client: Client,
+    level: int,
+    log: LogFn,
+    state: FlashFlowState,
+    reason: str,
+    *,
+    l1_to_l3_delay_sec: float = _SECURITY_L1_TO_L3_DELAY_SEC,
+    cancel: Optional[threading.Event] = None,
 ) -> None:
     lvl = int(level) & 0xFF
     if state.active_security_level == lvl:
         return
-    log("SecurityAccess: 切换到 level=0x%02X（%s）" % (lvl, reason))
-    client.unlock_security_access(lvl)
-    state.unlocked_levels.add(lvl)
-    state.active_security_level = lvl
+    if lvl == _FLASH_SEC_L3:
+        if state.active_security_level != _FLASH_SEC_L1:
+            _unlock_security_level(
+                client, _FLASH_SEC_L1, log, state, reason + "（L1→L3，不可直跳 L3）"
+            )
+        if state.active_security_level == _FLASH_SEC_L3:
+            return
+        _delay_between_security_l1_and_l3(l1_to_l3_delay_sec, cancel, log)
+        _unlock_security_level(client, _FLASH_SEC_L3, log, state, reason)
+        return
+    _unlock_security_level(client, lvl, log, state, reason)
+
+
+def _apply_flash_security_levels(
+    client: Client,
+    sec_levels: Sequence[int],
+    state: FlashFlowState,
+    cancel: threading.Event,
+    log: LogFn,
+    stage: str,
+    l1_to_l3_delay_sec: float,
+) -> None:
+    for level in _normalize_flash_security_levels(sec_levels):
+        if cancel.is_set():
+            raise FlashAborted("cancelled")
+        _ensure_security_level(
+            client,
+            int(level),
+            log,
+            state,
+            stage,
+            l1_to_l3_delay_sec=l1_to_l3_delay_sec,
+            cancel=cancel,
+        )
 
 
 def _reassert_programming_session_and_unlock(
@@ -259,6 +355,7 @@ def _reassert_programming_session_and_unlock(
     cancel: threading.Event,
     log: LogFn,
     reason: str,
+    l1_to_l3_delay_sec: float,
 ) -> None:
     """
     清除 FlashFlowState 会话假定后经 **Default→Extended→Programming** 再回到编程会话，再重温 SecurityAccess。
@@ -275,17 +372,15 @@ def _reassert_programming_session_and_unlock(
         % reason
     )
     _ensure_programming_via_default_extended(client, log, state)
-    for raw in sec_levels:
-        if cancel.is_set():
-            raise FlashAborted("cancelled")
-        level = int(raw) & 0xFF
-        log(
-            "SecurityAccess: unlock level=0x%02X（%s）"
-            % (level, reason)
-        )
-        client.unlock_security_access(level)
-        state.unlocked_levels.add(level)
-        state.active_security_level = level
+    _apply_flash_security_levels(
+        client,
+        sec_levels,
+        state,
+        cancel,
+        log,
+        reason,
+        l1_to_l3_delay_sec,
+    )
     _flash_tester_present_optional(
         client,
         log,
@@ -340,6 +435,7 @@ def _run_routines(
     cancel: threading.Event,
     state: FlashFlowState,
     sec_levels_reunlock_after_rid_dd02: Optional[Sequence[int]] = None,
+    l1_to_l3_delay_sec: float = _SECURITY_L1_TO_L3_DELAY_SEC,
 ) -> None:
     for step in steps:
         if cancel.is_set():
@@ -366,6 +462,7 @@ def _run_routines(
                 cancel,
                 log,
                 reason="YAML 中 RoutineControl DD02(type=start)完成后",
+                l1_to_l3_delay_sec=l1_to_l3_delay_sec,
             )
 
 
@@ -507,6 +604,9 @@ def _write_fingerprint_with_fallback(
     req_sec: Optional[int],
     state: FlashFlowState,
     log: LogFn,
+    *,
+    l1_to_l3_delay_sec: float = _SECURITY_L1_TO_L3_DELAY_SEC,
+    cancel: Optional[threading.Event] = None,
 ) -> None:
     if req_sess:
         _ensure_session(client, req_sess, log, state)
@@ -517,6 +617,8 @@ def _write_fingerprint_with_fallback(
             log,
             state,
             "WriteDataByIdentifier DID=0x%04X" % did,
+            l1_to_l3_delay_sec=l1_to_l3_delay_sec,
+            cancel=cancel,
         )
 
     payload = bytes([0x2E, (did >> 8) & 0xFF, did & 0xFF]) + bytes(data)
@@ -538,6 +640,8 @@ def _write_fingerprint_with_fallback(
                 log,
                 state,
                 "DID=0x%04X fallback retry" % did,
+                l1_to_l3_delay_sec=l1_to_l3_delay_sec,
+                cancel=cancel,
             )
         client.send_request(Request.from_payload(payload))
 
@@ -736,11 +840,12 @@ def _run_flash_download_items(
         if fl.diagnostic_sessions_before_download
         else list(_DEFAULT_DIAGNOSTIC_SESSIONS_BEFORE_DOWNLOAD)
     )
-    sec_levels = (
-        list(fl.security_access_levels_before_download)
+    sec_levels = _normalize_flash_security_levels(
+        fl.security_access_levels_before_download
         if fl.security_access_levels_before_download
-        else list(_DEFAULT_SECURITY_LEVELS_BEFORE_DOWNLOAD)
+        else _DEFAULT_SECURITY_LEVELS_BEFORE_DOWNLOAD
     )
+    sec_l1_l3_delay = _resolve_l1_to_l3_delay_sec(fl)
 
     log("刷写前准备：切换会话/执行预例程/安全解锁…")
     _sessions_then_routines_then_rest(
@@ -756,14 +861,15 @@ def _run_flash_download_items(
     if cancel.is_set():
         raise FlashAborted("cancelled")
 
-    for level in sec_levels:
-        if cancel.is_set():
-            raise FlashAborted("cancelled")
-        log("SecurityAccess: unlock level=0x%02X (before RequestDownload)" % int(level))
-        client.unlock_security_access(int(level))
-        level_i = int(level) & 0xFF
-        state.unlocked_levels.add(level_i)
-        state.active_security_level = level_i
+    _apply_flash_security_levels(
+        client,
+        sec_levels,
+        state,
+        cancel,
+        log,
+        "before RequestDownload",
+        sec_l1_l3_delay,
+    )
 
     if fl.fingerprint_did is not None and fl.fingerprint_data:
         did = int(fl.fingerprint_did) & 0xFFFF
@@ -778,6 +884,8 @@ def _run_flash_download_items(
             req_sec,
             state,
             log,
+            l1_to_l3_delay_sec=sec_l1_l3_delay,
+            cancel=cancel,
         )
 
     total_all = sum(int(x.size) for x in items)
@@ -819,6 +927,7 @@ def _run_flash_download_items(
             cancel,
             log,
             reason="数据传输结束(RequestTransferExit)后",
+            l1_to_l3_delay_sec=sec_l1_l3_delay,
         )
 
     if dd02_from_zip:
@@ -833,6 +942,7 @@ def _run_flash_download_items(
             cancel,
             log,
             reason="DD02(签名验签)长例程完成后",
+            l1_to_l3_delay_sec=sec_l1_l3_delay,
         )
 
     _run_routines(
@@ -844,6 +954,7 @@ def _run_flash_download_items(
         sec_levels_reunlock_after_rid_dd02=(
             tuple(sec_levels) if fl.post_transfer_routines else None
         ),
+        l1_to_l3_delay_sec=sec_l1_l3_delay,
     )
     _run_raw_requests(
         client,

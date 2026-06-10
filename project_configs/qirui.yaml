@@ -219,6 +219,8 @@ flash:
   override_block_payload: null
   # 34 应答后稍等再发 36（秒）；仍异常可试 0.5～1.0
   post_request_download_delay_sec: 0.35
+  # L1 解锁后稍等再解 L3（秒）；仍异常可试 0.5～1.0
+  security_l1_to_l3_delay_sec: 0.35
   transfer_exit_data: null
   # Pre-programming
   pre_transfer_raw_requests:
@@ -236,8 +238,7 @@ flash:
   # Programming session
   diagnostic_sessions_before_download:
     - programming
-  # SecurityAccess（会在会话/前置步骤后执行 unlock_security_access(level)）
-  # 0x01 => 27 01/02, 0x11 => 27 11/12
+  # SecurityAccess：须 lock→L1→L3；只写 0x11 时程序也会自动先解 0x01
   security_access_levels_before_download:
     - 0x01
     - 0x11
