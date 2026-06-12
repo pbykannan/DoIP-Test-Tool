@@ -34,10 +34,15 @@ import tempfile
 import zipfile
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from udsoncan import Request, services
+from udsoncan import Request, Response, services
 from udsoncan.client import Client
 from udsoncan.common.MemoryLocation import MemoryLocation
-from udsoncan.exceptions import NegativeResponseException, TimeoutException
+from udsoncan.exceptions import (
+    InvalidResponseException,
+    NegativeResponseException,
+    TimeoutException,
+    UnexpectedResponseException,
+)
 
 from doip_tester.config.models import AppConfig, RawRequestStep, RoutineStep
 
@@ -466,14 +471,78 @@ def _run_routines(
             )
 
 
+def _uds_p2_timeouts(client: Client) -> Tuple[float, float]:
+    p2 = float(client.config["p2_timeout"])
+    p2_star = float(client.config["p2_star_timeout"])
+    timing = getattr(client, "session_timing", None)
+    if timing is not None:
+        if getattr(timing, "p2_server_max", None) is not None:
+            p2 = float(timing.p2_server_max)
+        if getattr(timing, "p2_star_server_max", None) is not None:
+            p2_star = float(timing.p2_star_server_max)
+    return p2, p2_star
+
+
+def _send_suppress_positive_raw_request(client: Client, req: Request) -> None:
+    """
+    抑制正响应 UDS 请求：
+    - P2 内无应答 → 视为成功（符合 suppress 语义）；
+    - 收到 NRC 0x78 → 必须在 P2* 内等到最终正/负响应，否则报错（不继续后继步骤）。
+    """
+    conn = client.conn
+    if conn is None:
+        raise RuntimeError("UDS client has no connection")
+    if req.service is None:
+        raise ValueError("Request has no service")
+
+    p2, p2_star = _uds_p2_timeouts(client)
+    conn.empty_rxqueue()
+    conn.send(req.get_payload())
+
+    single_timeout = p2
+    pending_seen = False
+
+    while True:
+        try:
+            recv_payload = conn.wait_frame(timeout=single_timeout, exception=True)
+        except TimeoutException:
+            if pending_seen:
+                raise TimeoutException(
+                    "Suppress-positive UDS request (service 0x%02X) received NRC 0x78 "
+                    "but no final response within P2* (timeout=%.3f sec)"
+                    % (req.service.request_id(), single_timeout)
+                )
+            return
+
+        response = Response.from_payload(recv_payload)
+        client.last_response = response
+        if not response.valid:
+            raise InvalidResponseException(response)
+        assert response.service is not None
+        assert response.code is not None
+
+        if response.service.response_id() != req.service.response_id():
+            raise UnexpectedResponseException(
+                response,
+                "Response gotten from server has a service ID different than the request service ID. "
+                "Received=0x%02x, Expected=0x%02x"
+                % (response.service.response_id(), req.service.response_id()),
+            )
+
+        if response.positive:
+            return
+
+        if response.code == Response.Code.RequestCorrectlyReceived_ResponsePending:
+            pending_seen = True
+            single_timeout = p2_star
+            continue
+
+        raise NegativeResponseException(response)
+
+
 def _send_raw_uds_request(client: Client, req: Request) -> None:
-    """
-    带抑制正响应位（subfunction 0x8X）的请求：须等 NRC 0x78 及最终应答后再返回。
-    udsoncan 默认 suppress 会发完即返，导致后继请求与迟到的 28/85 应答串台。
-    """
     if req.suppress_positive_response:
-        with client.suppress_positive_response(wait_nrc=True):
-            client.send_request(req)
+        _send_suppress_positive_raw_request(client, req)
     else:
         client.send_request(req)
 
