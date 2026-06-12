@@ -70,6 +70,13 @@ class FlashAborted(Exception):
 
 
 TRANSFER_DATA_OVERHEAD = 2  # 0x36 + blockSequenceCounter per ISO-14229-1
+# ISO 14229-1：块序号 0x01…0xFF 后下一块为 0x00，再 0x01…（不可 FF 后直接回 0x01）
+_TRANSFER_DATA_FIRST_BLOCK_SEQ = 0x01
+
+
+def next_transfer_data_block_sequence(current: int) -> int:
+    """Return next TransferData blockSequenceCounter (single byte, wraps FF→00→01)."""
+    return (int(current) + 1) & 0xFF
 
 # 未在 YAML 中指定时使用（奇瑞等对端：03→02→27 L3→34）
 _DEFAULT_DIAGNOSTIC_SESSIONS_BEFORE_DOWNLOAD: List[str] = ["extended", "programming"]
@@ -853,7 +860,7 @@ def _transfer_one_file(
         rd_delay = float(rd_delay)
     _delay_after_request_download(rd_delay, cancel, log)
 
-    seq = 1
+    seq = _TRANSFER_DATA_FIRST_BLOCK_SEQ
     offset = 0
     total = item.size
     next_keepalive = time.monotonic() + _FLASH_KEEPALIVE_INTERVAL_SEC
@@ -883,9 +890,7 @@ def _transfer_one_file(
                 break
             client.transfer_data(seq, chunk)
             offset += len(chunk)
-            seq = (seq + 1) & 0xFF
-            if seq == 0:
-                seq = 1
+            seq = next_transfer_data_block_sequence(seq)
             if progress:
                 progress(bytes_done_before + offset, total_all)
 
