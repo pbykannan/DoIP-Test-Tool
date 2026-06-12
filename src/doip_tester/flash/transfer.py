@@ -466,6 +466,18 @@ def _run_routines(
             )
 
 
+def _send_raw_uds_request(client: Client, req: Request) -> None:
+    """
+    带抑制正响应位（subfunction 0x8X）的请求：须等 NRC 0x78 及最终应答后再返回。
+    udsoncan 默认 suppress 会发完即返，导致后继请求与迟到的 28/85 应答串台。
+    """
+    if req.suppress_positive_response:
+        with client.suppress_positive_response(wait_nrc=True):
+            client.send_request(req)
+    else:
+        client.send_request(req)
+
+
 def _run_raw_requests(
     client: Client,
     requests: List[RawRequestStep],
@@ -541,7 +553,7 @@ def _run_raw_requests(
                 state.unlocked_levels.clear()
                 state.active_security_level = None
             else:
-                client.send_request(req)
+                _send_raw_uds_request(client, req)
         if payload[0] == 0x10 and len(payload) >= 2:
             sf = payload[1] & 0x7F
             if sf == 0x01:
