@@ -253,14 +253,11 @@ flash:
     - routine_id: 0xDD03
       control_type: 1
       data: ""
-  # Post-programming（HardReset 前：仍使用当前 TCP 会话）
-  post_transfer_raw_requests:
-    - payload: "288003"
-      addressing: functional
-    - "1101"
-  # HardReset (1101) 后等对端镜像/服务端升级就绪再起 TCP（实测可能数分钟量级）
+  # Post-programming：DD03 完成后 TBOX 自行复位，不再发 11 01
+  post_transfer_raw_requests: []
+  # DD03 触发的自动复位后，等对端升级就绪再起 TCP（实测可能数分钟量级）
   post_transfer_reconnect_delay_sec: 350
-  # HardReset、重连后继续（扩展会话清理等）
+  # 重连后继续（扩展会话清理等）
   post_transfer_after_reconnect_raw_requests:
     - "1003"
     - "14FFFFFF"

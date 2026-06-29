@@ -108,9 +108,9 @@ class FlashConfig:
     fingerprint_data: Optional[bytes] = None
     # 刷写后验签/后处理（ECU 仍在线、未复位）
     post_transfer_routines: List[RoutineStep] = field(default_factory=list)
-    # 复位前应执行完的原始请求（常以 2880、1001、1101 结束）
+    # 后编程例程与重连之间的原始 UDS（可为空；DD03 后 ECU 自动复位时通常不发 11 01）
     post_transfer_raw_requests: List[RawRequestStep] = field(default_factory=list)
-    # ECU HardReset(11 01) 后等待秒数再起新 TCP（仅当配置了 post_transfer_after_reconnect_* 时使用）
+    # ECU 复位后等待秒数再起新 TCP（仅当配置了 post_transfer_after_reconnect_* 时使用）
     post_transfer_reconnect_delay_sec: Optional[float] = None
     # 复位重连后继续执行的原始请求（1003 / 14 / 85 / 1081 等）
     post_transfer_after_reconnect_raw_requests: List[RawRequestStep] = field(

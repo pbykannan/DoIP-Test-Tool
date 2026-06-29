@@ -63,7 +63,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 使用 `scripts\build_windows_exe.bat` 时，产物文件名为 **`dist\DoIPTester_yy.mm.dd.nn.exe`**（与嵌入版本、窗口标题一致），便于区分多次打包。
 
-打包脚本会清空 `HTTP(S)_PROXY` 并对 pip 传入 `--proxy ""`，避免无效代理导致 **`ProxyError: Cannot connect to proxy`**（常见于代理指向不存在的脚本路径）。若仍失败，请检查 **`%APPDATA%\pip\pip.ini`** 里是否配置了 `[global] proxy`，临时删掉或改用可用代理后再执行 `pip install`。
+打包脚本通过 `scripts\pip_no_proxy.py` 安装依赖，绕过 Windows 注册表/无效代理（浏览器能上网时 pip 仍可能 `ProxyError`）。若仍失败，请检查 **`%APPDATA%\pip\pip.ini`** 里的 `proxy` 行，或手动执行：`python scripts\pip_no_proxy.py install -r requirements.txt pyinstaller`。
 
 或在 PowerShell 手动：
 
