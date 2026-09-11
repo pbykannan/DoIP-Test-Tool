@@ -20,19 +20,27 @@
 
 可通过配置补齐 OEM 步骤：pre/post 原始 UDS、2E F184 指纹、post 例程（验签/后处理）。
 
-后编程：**XML/ZIP 推导的 DD02** 早于 ``flash.post_transfer_routines``（如 FF01、DD03）执行，与同端流程一致时可保持此顺序。
+后编程（奇瑞 CBF/RSA 新流程）：先 **0x34/36/37 传 .cbf**，再传 **.rsa 原文**（2302 字节文本）；
+随后 **DD02（31 01 DD 02 + 384 字节签名）→ FF01 → DD03**（见 ``flash.post_transfer_routines``）。
+34/36/37 传 .rsa 时不截断；DD02 的 option record 从 .rsa 解析出 384 字节二进制签名（EEA5.0 规范 #5…#N）。
+**DD03 后设备自行升级，勿发 11 01**；断开等待后由 ``post_transfer_after_reconnect_raw_requests`` 做通信恢复。
+
+后编程（北汽 N80KS v515 文档图9 流程）：11 01 触发 OTA 后设备复位掉线，工具轮询重连直到 PHY 重建，
+随后按 ``post_transfer_after_reconnect_raw_requests`` 以**功能寻址**依次执行 10 03 → 28 00 01 → 85 01 →
+10 01 → 14 FF FF FF（功能寻址请求无应答视为成功，见 ``uds.use_server_timing``/``addressing`` 配置）。
 """
 
 import threading
 import time
+import xml.etree.ElementTree as ET
+import shutil
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-import re
-import shutil
 import tempfile
-import zipfile
-from typing import Callable, List, Optional, Sequence, Tuple
+import re
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from udsoncan import Request, Response, services
 from udsoncan.client import Client
@@ -56,6 +64,8 @@ class TransferItem:
     name: str
     path: Path
     size: int
+    # 北汽 v515：文件对应 31 01 0202 完整性校验用的 256 字节 RSA 签名（来自 5-*.xml）
+    signature: Optional[bytes] = None
 
 
 @dataclass
@@ -89,6 +99,7 @@ _FLASH_SEC_L3 = 0x11
 # - security index 0/1/2 = 0x00 / 0x01 / 0x11
 # 刷写流程中用到的 31 RID 约束（仅列我们当前链路会出现的）
 _RID_REQUIRED_SESSION = {
+    0x0202: "programming", # CheckRoutine（北汽 v515 完整性校验：CRC32/签名）
     0x0203: "extended",    # CheckProgrammingPreconditions
     0xFF00: "programming", # EraseMemory
     0xFF01: "programming", # CheckProgrammingDependencies
@@ -105,7 +116,7 @@ _DID_WRITE_REQUIREMENT = {
 
 # 刷写循环内周期性 3E（抑制正响应）；GUI 定时 TP 在 worker 持锁刷写时无法插队。
 # TransferData 外：会话重申与安全访问之后由 _flash_tester_present_optional 再发 3E80，刷新 S3。
-# 固定 2s 节拍（仅 34/36 循环内）。
+# 块间隙：仅当距上次 UDS 活动超过该间隔才发 3E；每块 36/76 本身会刷新 S3，不得每块都插 3E。
 _FLASH_KEEPALIVE_INTERVAL_SEC = 2.0
 # 34 正答后 ECU 常需准备下载缓冲区；立即发 36 易 TCP/无 76。YAML 未配时用此默认值。
 _POST_REQUEST_DOWNLOAD_DELAY_SEC = 0.35
@@ -173,16 +184,28 @@ def _uds_is_tester_present_negative(payload: bytes) -> bool:
     return len(payload) >= 2 and payload[0] == 0x7F and payload[1] == 0x3E
 
 
+def _uds_is_tester_present_positive(payload: bytes) -> bool:
+    return len(payload) >= 1 and payload[0] == 0x7E
+
+
+def _uds_is_tester_present_pending(payload: bytes) -> bool:
+    return (
+        len(payload) >= 3
+        and payload[0] == 0x7F
+        and payload[1] == 0x3E
+        and payload[2] == Response.Code.RequestCorrectlyReceived_ResponsePending
+    )
+
+
 def _drain_late_responses_after_tester_present(
     client: Client,
     log: LogFn,
-    max_total_sec: float = 0.35,
+    max_total_sec: float = 2.0,
     slice_sec: float = 0.05,
 ) -> None:
     """
-    刷写循环里在 36 块之间发 3E80 时，若对端回 7F 3E xx 较晚，可读尽以免串台。
-    绝不能把其它 PDU（例如后续请求才该处理的 7F 37 78 / 76 xx）无脑丢掉，否则等价于丢弃 pending，
-    send_request 会误判 P2 超时。
+    发完 3E80 后排空对端回包，再发下一条 36，避免 7E / 7F 3E 78 串进 TransferData 等待。
+    遇到 7F 3E 78 时延长等待以收齐最终 3E 应答；其它非 3E PDU 回填队列。
     """
     conn = getattr(client, "conn", None)
     if conn is None:
@@ -190,19 +213,29 @@ def _drain_late_responses_after_tester_present(
     doip_conn = getattr(conn, "_connection", None)
     t0 = time.monotonic()
     drained_tp = 0
+    pending_78 = False
     while time.monotonic() - t0 < max_total_sec:
         try:
             recv_payload = conn.wait_frame(timeout=slice_sec, exception=True)
         except TimeoutException:
+            if pending_78:
+                continue
             break
         except Exception as exc:
             log("刷写保活: 排空迟到响应时出现异常（已停止排空）: %s" % exc)
             break
         if not recv_payload:
             continue
-        if _uds_is_tester_present_negative(recv_payload):
+        if _uds_is_tester_present_pending(recv_payload):
+            pending_78 = True
             drained_tp += 1
             continue
+        if _uds_is_tester_present_negative(recv_payload) or _uds_is_tester_present_positive(
+            recv_payload
+        ):
+            pending_78 = False
+            drained_tp += 1
+            break
         hex_preview = recv_payload[:24].hex()
         if len(recv_payload) > 24:
             hex_preview += "..."
@@ -214,9 +247,20 @@ def _drain_late_responses_after_tester_present(
         break
     if drained_tp:
         log(
-            "刷写保活: 已丢弃 %d 条迟到的 TesterPresent NRC（7F 3E xx）再继续后续诊断"
+            "刷写保活: 已消化 %d 条 TesterPresent 相关回包后再继续后续诊断"
             % drained_tp
         )
+
+
+def _flash_tester_present_between_blocks(client: Client, log: LogFn) -> None:
+    """36 块间隙保活：必须收齐/排空 3E 相关应答后再发下一块，禁止 fire-and-forget。"""
+    try:
+        with client.suppress_positive_response(wait_nrc=True):
+            client.tester_present()
+    except Exception as exc:
+        # 部分 ECU 忽略 suppress 回 7E，或回其它 NRC；先排空再继续，避免卡死整次刷写
+        log("刷写保活 TesterPresent 异常（将排空后继续）: %s" % exc)
+    _drain_late_responses_after_tester_present(client, log)
 
 
 def _flash_tester_present_optional(client: Client, log: LogFn, detail: str) -> None:
@@ -306,7 +350,15 @@ def _unlock_security_level(
 ) -> None:
     lvl = int(level) & 0xFF
     log("SecurityAccess: unlock level=0x%02X（%s）" % (lvl, reason))
-    client.unlock_security_access(lvl)
+    resp = client.unlock_security_access(lvl)
+    sd = getattr(resp, "service_data", None)
+    seed = getattr(sd, "seed", None)
+    if seed is not None and len(seed) > 0 and seed == b"\x00" * len(seed):
+        # v515 协议栈：请求 level 已解锁时返回全 0 seed，udsoncan 据此跳过 27 02。
+        log(
+            "SecurityAccess: 对端返回全 0 seed → level 0x%02X 已解锁，27 02 未发送（正常）"
+            % lvl
+        )
     state.unlocked_levels.add(lvl)
     state.active_security_level = lvl
 
@@ -409,10 +461,15 @@ def _sessions_then_routines_then_rest(
     log: LogFn,
     cancel: threading.Event,
     state: FlashFlowState,
+    sec_levels: Optional[Sequence[int]] = None,
+    l1_to_l3_delay_sec: float = _SECURITY_L1_TO_L3_DELAY_SEC,
 ) -> None:
     """
     先切第一个 extended（若存在），再跑 pre_transfer_routines，再切剩余会话。
     使 31 预条件等步骤落在扩展会话内，与对端 doip_callback 中 RID 要求一致。
+
+    ``sec_levels`` 非空时，若首会话为 extended 且含 Level1(0x01)，则在预例程之后、
+    切到 programming 之前先解锁 L1（北汽 TBX 协议：27 01/02 仅在 extended 会话执行）。
     """
     idx = 0
     n = len(sessions)
@@ -433,6 +490,20 @@ def _sessions_then_routines_then_rest(
     )
     _run_routines(client, routines, log, cancel, state)
 
+    if sec_levels and 0x01 in set(int(x) & 0xFF for x in sec_levels):
+        if cancel.is_set():
+            raise FlashAborted("cancelled")
+        log("安全访问: 按北汽 TBX 协议在 extended 会话先解锁 Level1(0x01)")
+        _ensure_security_level(
+            client,
+            _FLASH_SEC_L1,
+            log,
+            state,
+            "extended 会话解锁 Level1",
+            l1_to_l3_delay_sec=l1_to_l3_delay_sec,
+            cancel=cancel,
+        )
+
     while idx < n:
         if cancel.is_set():
             raise FlashAborted("cancelled")
@@ -448,6 +519,7 @@ def _run_routines(
     state: FlashFlowState,
     sec_levels_reunlock_after_rid_dd02: Optional[Sequence[int]] = None,
     l1_to_l3_delay_sec: float = _SECURITY_L1_TO_L3_DELAY_SEC,
+    dd02_signature: Optional[bytes] = None,
 ) -> None:
     for step in steps:
         if cancel.is_set():
@@ -456,11 +528,25 @@ def _run_routines(
         req_sess = _RID_REQUIRED_SESSION.get(int(step.routine_id) & 0xFFFF)
         if req_sess:
             _ensure_session(client, req_sess, log, state)
-        log("RoutineControl 0x%04X type=%s" % (step.routine_id, step.control_type))
+        rid = int(step.routine_id) & 0xFFFF
+        routine_data = step.data or None
+        if (
+            rid == 0xDD02
+            and int(step.control_type) == 1
+            and not routine_data
+            and dd02_signature
+        ):
+            routine_data = dd02_signature
+            log(
+                "RoutineControl 0xDD02 type=1 (携带 RSA 解析签名, len=%d bytes)"
+                % len(dd02_signature)
+            )
+        else:
+            log("RoutineControl 0x%04X type=%s" % (step.routine_id, step.control_type))
         client.routine_control(
             routine_id=step.routine_id,
             control_type=step.control_type,
-            data=step.data or None,
+            data=routine_data,
         )
         if (
             sec_levels_reunlock_after_rid_dd02 is not None
@@ -628,6 +714,10 @@ def _run_raw_requests(
                 state.current_session = None
                 state.unlocked_levels.clear()
                 state.active_security_level = None
+            elif mode == "functional":
+                # 功能寻址请求：ECU 通常抑制正响应，无应答视为成功；
+                # 收到 NRC 0x78 仍须等 P2* 内的最终正/负响应。
+                _send_suppress_positive_raw_request(client, req)
             else:
                 _send_raw_uds_request(client, req)
         if payload[0] == 0x10 and len(payload) >= 2:
@@ -646,42 +736,329 @@ def _run_raw_requests(
                 state.active_security_level = None
 
 
-def _extract_dd02_signature_from_xml(xml_bytes: bytes, target_zip_name: str) -> bytes:
+def _parse_dd02_signature_from_rsa(rsa_path: Path) -> bytes:
+    """从 .rsa 文本（0xNN, 0xNN, …）解析 DD02 option record 所需的二进制签名。"""
+    raw = rsa_path.read_bytes()
     text = None
-    for enc in ("utf-8", "gb18030", "latin1"):
+    for enc in ("utf-8", "ascii", "latin1"):
         try:
-            text = xml_bytes.decode(enc)
+            text = raw.decode(enc)
             break
         except Exception:
             continue
     if text is None:
-        raise ValueError("签名 XML 解码失败")
+        raise ValueError("RSA 文件解码失败: %s" % rsa_path)
+    vals = [int(x, 16) for x in re.findall(r"0x[0-9A-Fa-f]+", text)]
+    if not vals:
+        raise ValueError("RSA 文件中未找到 0xNN 格式的签名数据: %s" % rsa_path.name)
+    sig = bytes(int(v) & 0xFF for v in vals)
+    if len(sig) != 384:
+        raise ValueError(
+            "RSA 解析签名长度=%d bytes（DD02 期望 384 bytes）: %s"
+            % (len(sig), rsa_path.name)
+        )
+    return sig
 
-    target = Path(target_zip_name).name.strip()
-    list_pat = re.compile(r"<list>(.*?)</list>", re.IGNORECASE | re.DOTALL)
-    name_pat = re.compile(r"<fileName>\s*(.*?)\s*</fileName>", re.IGNORECASE | re.DOTALL)
-    sig_pat = re.compile(r"<fileSIG>\s*([0-9A-Fa-f\s]+)\s*</fileSIG>", re.IGNORECASE | re.DOTALL)
-    for block in list_pat.findall(text):
-        m_name = name_pat.search(block)
-        m_sig = sig_pat.search(block)
-        if not m_name or not m_sig:
+
+def generate_dummy_rsa(cbf_path: Path) -> Path:
+    """为 .cbf 生成配套的临时 .rsa（384 字节全 0xFF），用于 server 跳过签名校验时的占位传输。"""
+    rsa_path = cbf_path.with_suffix(".rsa")
+    content = ", ".join("0xFF" for _ in range(384))
+    rsa_path.write_text(content, encoding="ascii")
+    return rsa_path
+
+
+def _cbf_rsa_transfer_items(cbf: Path, rsa: Path, log: LogFn) -> Tuple[List[TransferItem], bytes]:
+    if not cbf.is_file():
+        raise FileNotFoundError("CBF 文件不存在: %s" % cbf)
+    if not rsa.is_file():
+        raise FileNotFoundError("RSA 文件不存在: %s" % rsa)
+    dd02_signature = _parse_dd02_signature_from_rsa(rsa)
+    log(
+        "刷写准备: CBF/RSA 模式，第1个传输=%s (%d bytes)，第2个传输=%s (%d bytes，原文直传)，DD02签名=%d bytes"
+        % (cbf.name, cbf.stat().st_size, rsa.name, rsa.stat().st_size, len(dd02_signature))
+    )
+    return [
+        TransferItem(name=cbf.name, path=cbf, size=cbf.stat().st_size),
+        TransferItem(name=rsa.name, path=rsa, size=rsa.stat().st_size),
+    ], dd02_signature
+
+
+def _resolve_cbf_rsa_pair(path: Path) -> Tuple[Path, Path]:
+    suffix = path.suffix.lower()
+    if suffix == ".cbf":
+        cbf, rsa = path, path.with_suffix(".rsa")
+    elif suffix == ".rsa":
+        rsa, cbf = path, path.with_suffix(".cbf")
+    else:
+        raise ValueError("请选择 .cbf 或 .rsa 文件，或包含成对文件的目录: %s" % path)
+    return cbf, rsa
+
+
+def _find_cbf_rsa_in_directory(path: Path) -> Tuple[Path, Path]:
+    files = [p for p in path.iterdir() if p.is_file()]
+    cbf_by_stem = {p.stem: p for p in files if p.suffix.lower() == ".cbf"}
+    rsa_by_stem = {p.stem: p for p in files if p.suffix.lower() == ".rsa"}
+    common = sorted(set(cbf_by_stem) & set(rsa_by_stem))
+    if not common:
+        raise ValueError("目录内需同时包含成对的 .cbf 与 .rsa 文件: %s" % path)
+    if len(common) > 1:
+        stem = max(common, key=lambda s: cbf_by_stem[s].stat().st_size)
+    else:
+        stem = common[0]
+    return cbf_by_stem[stem], rsa_by_stem[stem]
+
+
+def _s19_zip_transfer_items(
+    s19: Path, zip_file: Path, log: LogFn, xml_path: Optional[Path] = None
+) -> Tuple[List[TransferItem], None]:
+    """北汽 v515：34/36/37 依次传输 .s19（先）与 .zip（后），服务端分别保存到
+    /tmp/download.s19 与 /tmp/download.zip；无 DD02 签名。
+
+    ``xml_path`` 为签名清单（5-*.xml）时，解析其中每个文件的 256 字节 RSA 签名
+    并附加到对应 TransferItem，供 31 01 0202 完整性校验使用。
+    """
+    if not s19.is_file():
+        raise FileNotFoundError("S19 文件不存在: %s" % s19)
+    if not zip_file.is_file():
+        raise FileNotFoundError("ZIP 文件不存在: %s" % zip_file)
+    if xml_path is None:
+        raise FileNotFoundError(
+            "未找到签名清单（5-*.xml）: %s。v515 刷写必须提供 S19/ZIP 对应的 RSA 签名文件。"
+            % s19.parent
+        )
+    sig_map = parse_signature_xml(xml_path)
+    if not sig_map:
+        raise ValueError("签名清单 %s 未解析出任何有效签名（需 256 字节 RSA）" % xml_path)
+    s19_sig = _match_signature(sig_map, s19)
+    zip_sig = _match_signature(sig_map, zip_file)
+    missing = []
+    if s19_sig is None:
+        missing.append(s19.name)
+    if zip_sig is None:
+        missing.append(zip_file.name)
+    if missing:
+        raise ValueError(
+            "签名清单 %s 中缺少以下文件的签名: %s" % (xml_path.name, ", ".join(missing))
+        )
+    log(
+        "刷写准备: S19/ZIP 模式，第1个传输=%s (%d bytes)，签名=%s，第2个传输=%s (%d bytes)，签名=%s"
+        % (
+            s19.name,
+            s19.stat().st_size,
+            "256字节(%s...)" % s19_sig[:8].hex().upper(),
+            zip_file.name,
+            zip_file.stat().st_size,
+            "256字节(%s...)" % zip_sig[:8].hex().upper(),
+        )
+    )
+    return [
+        TransferItem(name=s19.name, path=s19, size=s19.stat().st_size, signature=s19_sig),
+        TransferItem(
+            name=zip_file.name, path=zip_file, size=zip_file.stat().st_size, signature=zip_sig
+        ),
+    ], None
+
+
+def parse_signature_xml(xml_path: Path) -> Dict[str, bytes]:
+    """解析北汽 5-*.xml 签名清单。
+
+    返回 ``{fileName: 256 字节签名}``，fileName 为清单中的原始文件名（通常无扩展名，
+    如 ``1-TBX_E00156231_V001`` / ``2-TBXE0015623112``）。非 256 字节签名项跳过。
+    """
+    root = ET.parse(str(xml_path)).getroot()
+    out: Dict[str, bytes] = {}
+    for node in root.iter("list"):
+        name_el = node.find("fileName")
+        sig_el = node.find("fileSIG")
+        if name_el is None or sig_el is None or sig_el.text is None:
             continue
-        name = str(m_name.group(1) or "").strip()
-        if Path(name).name != target:
+        hex_text = "".join(str(sig_el.text).split())
+        if len(hex_text) != 512:
             continue
-        sig_hex = re.sub(r"\s+", "", str(m_sig.group(1) or ""))
-        if not sig_hex:
-            break
         try:
-            sig = bytes.fromhex(sig_hex)
-        except Exception as exc:
-            raise ValueError("XML 中 fileSIG 不是合法十六进制") from exc
-        if len(sig) < 256:
-            raise ValueError(
-                "XML 签名长度过短：%d bytes（DD02 通常需 >=256 bytes）" % len(sig)
-            )
-        return sig
-    raise ValueError("未在签名 XML 中找到 %s 对应的 fileSIG" % target)
+            sig = bytes.fromhex(hex_text)
+        except ValueError:
+            continue
+        out[str(name_el.text).strip()] = sig
+    return out
+
+
+def _match_signature(sig_map: Dict[str, bytes], item_path: Path) -> Optional[bytes]:
+    """按文件名从签名清单匹配：完整 stem 相等，或清单名是 stem 前缀（zip 常带版本后缀）。"""
+    stem = item_path.stem
+    for name, sig in sig_map.items():
+        if stem == name or stem.startswith(name) or name.startswith(stem):
+            return sig
+    return None
+
+
+def _find_signature_xml(directory: Path) -> Optional[Path]:
+    """目录内找签名清单：优先 ``5-*.xml``，其次含 CRC 的 ``*.xml``，其次唯一 ``.xml``。"""
+    files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".xml"]
+    if not files:
+        return None
+    five = [p for p in files if p.name.startswith("5-")]
+    if five:
+        return max(five, key=lambda p: p.stat().st_size)
+    crc = [p for p in files if "crc" in p.stem.lower()]
+    if crc:
+        return max(crc, key=lambda p: p.stat().st_size)
+    if len(files) == 1:
+        return files[0]
+    return max(files, key=lambda p: p.stat().st_size)
+
+
+def _pick_sibling_s19_zip(side_path: Path, want_suffix: str) -> Path:
+    """单文件场景：优先同 stem 配对；否则目录内唯一匹配；多个时取最大。"""
+    same_stem = side_path.with_suffix(want_suffix)
+    if same_stem.is_file():
+        return same_stem
+    cands = [
+        p
+        for p in side_path.parent.iterdir()
+        if p.is_file() and p.suffix.lower() == want_suffix
+    ]
+    if len(cands) == 1:
+        return cands[0]
+    if len(cands) > 1:
+        return max(cands, key=lambda p: p.stat().st_size)
+    raise ValueError(
+        "未找到与 %s 配对的 %s 文件（期望同目录存在 .s19 与 .zip）"
+        % (side_path.name, want_suffix)
+    )
+
+
+def _resolve_s19_zip_pair(path: Path) -> Tuple[Path, Path, Optional[Path]]:
+    suffix = path.suffix.lower()
+    if suffix == ".s19":
+        s19, zip_file = path, _pick_sibling_s19_zip(path, ".zip")
+    elif suffix == ".zip":
+        zip_file, s19 = path, _pick_sibling_s19_zip(path, ".s19")
+    else:
+        raise ValueError("请选择 .s19 或 .zip 文件，或包含成对文件的目录: %s" % path)
+    xml_path = _find_signature_xml(path.parent)
+    return s19, zip_file, xml_path
+
+
+_EXTRACTED_TEMP_DIRS: List[Path] = []
+
+
+def _is_doip_package(zip_path: Path) -> bool:
+    """判断 zip 是否为外层 DoIP 包：内部同时包含 .s19、.xml、.zip 三类文件。"""
+    try:
+        with zipfile.ZipFile(str(zip_path)) as zf:
+            lower = [n.lower() for n in zf.namelist()]
+    except (zipfile.BadZipFile, OSError):
+        return False
+    return (
+        any(n.endswith(".s19") for n in lower)
+        and any(n.endswith(".xml") for n in lower)
+        and any(n.endswith(".zip") for n in lower)
+    )
+
+
+def _extract_doip_package(zip_path: Path) -> Path:
+    """解压外层 DoIP 包到临时目录并登记清理；返回临时目录路径。"""
+    td = Path(tempfile.mkdtemp(prefix="doip_pkg_"))
+    _EXTRACTED_TEMP_DIRS.append(td)
+    with zipfile.ZipFile(str(zip_path)) as zf:
+        zf.extractall(str(td))
+    return td
+
+
+def _cleanup_extracted_dirs() -> None:
+    for td in _EXTRACTED_TEMP_DIRS:
+        shutil.rmtree(str(td), ignore_errors=True)
+    del _EXTRACTED_TEMP_DIRS[:]
+
+
+def _locate_s19_zip_xml(
+    directory: Path, depth: int = 3
+) -> Optional[Tuple[Path, Path, Optional[Path]]]:
+    """从目录树中递归定位 s19+zip+签名xml 三件套，最多下探 depth 层。"""
+    try:
+        return _find_s19_zip_in_directory(directory)
+    except ValueError:
+        pass
+    if depth <= 0:
+        return None
+    for sub in sorted(directory.iterdir(), key=lambda p: p.name):
+        if sub.is_dir():
+            found = _locate_s19_zip_xml(sub, depth - 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_s19_zip_in_directory(
+    path: Path,
+) -> Tuple[Path, Path, Optional[Path]]:
+    files = [p for p in path.iterdir() if p.is_file()]
+    s19_by_stem = {p.stem: p for p in files if p.suffix.lower() == ".s19"}
+    zip_by_stem = {p.stem: p for p in files if p.suffix.lower() == ".zip"}
+    if not s19_by_stem or not zip_by_stem:
+        raise ValueError("目录内需同时包含 .s19 与 .zip 文件: %s" % path)
+    common = sorted(set(s19_by_stem) & set(zip_by_stem))
+    if common:
+        if len(common) > 1:
+            stem = max(common, key=lambda s: s19_by_stem[s].stat().st_size)
+        else:
+            stem = common[0]
+        s19, zip_file = s19_by_stem[stem], zip_by_stem[stem]
+    else:
+        s19 = max(s19_by_stem.values(), key=lambda p: p.stat().st_size)
+        zip_file = max(zip_by_stem.values(), key=lambda p: p.stat().st_size)
+    xml_path = _find_signature_xml(path)
+    return s19, zip_file, xml_path
+
+
+def _prepare_transfer_items_from_path(
+    path: Path, log: LogFn
+) -> Tuple[List[TransferItem], Optional[bytes]]:
+    if not path.exists():
+        raise FileNotFoundError("刷写输入不存在: %s" % path)
+
+    if path.is_dir():
+        # 优先 S19/ZIP（北汽 v515 两文件模型）；否则 CBF/RSA（奇瑞 v116）。
+        try:
+            s19, zip_file, xml_path = _find_s19_zip_in_directory(path)
+            return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+        except ValueError:
+            pass
+        cbf, rsa = _find_cbf_rsa_in_directory(path)
+        return _cbf_rsa_transfer_items(cbf, rsa, log)
+
+    suffix = path.suffix.lower()
+    if suffix == ".zip":
+        # 优先识别外层 DoIP 包（内含 s19+xml+zip 三件套）→ 解压后定位三件套
+        if _is_doip_package(path):
+            log("刷写准备: %s 识别为外层 DoIP 包，解压后定位其中 s19/xml/zip 三件套" % path.name)
+            extracted = _extract_doip_package(path)
+            trio = _locate_s19_zip_xml(extracted)
+            if trio is None:
+                raise ValueError(
+                    "外层 DoIP 包内未找到 s19+xml+zip 三件套: %s" % path.name
+                )
+            s19, zip_file, xml_path = trio
+            return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+        # 否则视为内层升级包（2-TBX*.zip），同目录配对 s19 与签名
+        s19, zip_file, xml_path = _resolve_s19_zip_pair(path)
+        return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+    if suffix in (".cbf", ".rsa"):
+        cbf, rsa = _resolve_cbf_rsa_pair(path)
+        return _cbf_rsa_transfer_items(cbf, rsa, log)
+    if suffix == ".s19":
+        s19, zip_file, xml_path = _resolve_s19_zip_pair(path)
+        return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+    if suffix == ".xml":
+        # 直接选了签名清单：同目录找 1-*.s19 与 2-*.zip
+        s19, zip_file = _pick_sibling_s19_zip(path, ".s19"), _pick_sibling_s19_zip(
+            path, ".zip"
+        )
+        return _s19_zip_transfer_items(s19, zip_file, log, path)
+
+    return [TransferItem(name=path.name, path=path, size=path.stat().st_size)], None
 
 
 def _write_fingerprint_with_fallback(
@@ -734,89 +1111,6 @@ def _write_fingerprint_with_fallback(
         client.send_request(Request.from_payload(payload))
 
 
-def _prepare_transfer_items_from_path(
-    path: Path, temp_dir: Path, log: LogFn
-) -> Tuple[List[TransferItem], Optional[bytes]]:
-    if not path.exists():
-        raise FileNotFoundError("刷写输入不存在: %s" % path)
-
-    if path.is_dir():
-        t0 = time.monotonic()
-        files = [p for p in path.iterdir() if p.is_file()]
-        zip_files = [p for p in files if p.suffix.lower() == ".zip"]
-        xml_files = [p for p in files if p.suffix.lower() == ".xml"]
-        if not zip_files or not xml_files:
-            raise ValueError("目录内需同时包含升级 zip 与签名 xml: %s" % path)
-        zip_file = max(zip_files, key=lambda p: p.stat().st_size)
-        preferred_xml = [
-            p for p in xml_files if ("sig" in p.name.lower() or "crc" in p.name.lower())
-        ]
-        xml_file = preferred_xml[0] if preferred_xml else xml_files[0]
-        dd02_signature = _extract_dd02_signature_from_xml(xml_file.read_bytes(), zip_file.name)
-        log(
-            "刷写准备: 目录模式，解析耗时=%.2fs，升级包=%s (%d bytes), 签名=%s (%d bytes), DD02签名字节=%d"
-            % (
-                time.monotonic() - t0,
-                zip_file.name,
-                zip_file.stat().st_size,
-                xml_file.name,
-                xml_file.stat().st_size,
-                len(dd02_signature),
-            )
-        )
-        return [
-            TransferItem(name=zip_file.name, path=zip_file, size=zip_file.stat().st_size),
-            TransferItem(name=xml_file.name, path=xml_file, size=xml_file.stat().st_size),
-        ], dd02_signature
-
-    if path.suffix.lower() != ".zip":
-        return [TransferItem(name=path.name, path=path, size=path.stat().st_size)], None
-
-    t0 = time.monotonic()
-    with zipfile.ZipFile(path, "r") as zf:
-        members = [n for n in zf.namelist() if n and not n.endswith("/")]
-        zip_members = [n for n in members if n.lower().endswith(".zip")]
-        xml_members = [n for n in members if n.lower().endswith(".xml")]
-        if not zip_members or not xml_members:
-            log("外层 ZIP 内未同时发现升级 ZIP + 签名 XML，按单文件直传")
-            return [TransferItem(name=path.name, path=path, size=path.stat().st_size)], None
-
-        zip_member = max(zip_members, key=lambda n: zf.getinfo(n).file_size)
-        preferred_xml = [n for n in xml_members if ("sig" in n.lower() or "crc" in n.lower())]
-        xml_member = preferred_xml[0] if preferred_xml else xml_members[0]
-
-        zip_name = Path(zip_member).name
-        xml_name = Path(xml_member).name
-        extracted_zip = temp_dir / zip_name
-        extracted_xml = temp_dir / xml_name
-
-        t_extract = time.monotonic()
-        with zf.open(zip_member, "r") as src, extracted_zip.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 1024)
-        with zf.open(xml_member, "r") as src, extracted_xml.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=64 * 1024)
-        t_extract_done = time.monotonic()
-
-    xml_bytes = extracted_xml.read_bytes()
-    dd02_signature = _extract_dd02_signature_from_xml(xml_bytes, zip_name)
-    log(
-        "刷写准备: 检测到双文件包，提取耗时=%.2fs，总准备耗时=%.2fs，升级包=%s (%d bytes), 签名=%s (%d bytes), DD02签名字节=%d"
-        % (
-            t_extract_done - t_extract,
-            time.monotonic() - t0,
-            zip_name,
-            extracted_zip.stat().st_size,
-            xml_name,
-            extracted_xml.stat().st_size,
-            len(dd02_signature),
-        )
-    )
-    return [
-        TransferItem(name=zip_name, path=extracted_zip, size=extracted_zip.stat().st_size),
-        TransferItem(name=xml_name, path=extracted_xml, size=extracted_xml.stat().st_size),
-    ], dd02_signature
-
-
 def _transfer_one_file(
     client: Client,
     fl,
@@ -828,8 +1122,16 @@ def _transfer_one_file(
     total_all: int,
     state: FlashFlowState,
 ) -> int:
-    # v116 对应链路：34/36/37 在 programming + security(0/1)，这里固定切到 0x01。
-    _ensure_security_level(client, 0x01, log, state, "before RequestDownload")
+    # v116：34/36/37 在 programming + security(0/1)，默认确保 0x01；
+    # 北汽 v515：34/36/37 需 Level3(0x11)，由 flash.transfer_security_level 指定。
+    sec_lvl = int(getattr(fl, "transfer_security_level", None) or _FLASH_SEC_L1) & 0xFF
+    _ensure_security_level(
+        client,
+        sec_lvl,
+        log,
+        state,
+        "before RequestDownload (transfer_security_level=0x%02X)" % sec_lvl,
+    )
     mem = MemoryLocation(
         address=fl.memory_address,
         memorysize=item.size,
@@ -863,8 +1165,10 @@ def _transfer_one_file(
     seq = _TRANSFER_DATA_FIRST_BLOCK_SEQ
     offset = 0
     total = item.size
+    # 以「上次诊断活动」为基准；每块 36 成功后重置，避免几乎每块都插 3E 与 36 抢应答
     next_keepalive = time.monotonic() + _FLASH_KEEPALIVE_INTERVAL_SEC
     keepalive_logged = False
+    prev_block_done: Optional[float] = None
     with item.path.open("rb") as fp:
         while offset < total:
             if cancel.is_set():
@@ -872,33 +1176,90 @@ def _transfer_one_file(
             now = time.monotonic()
             if now >= next_keepalive:
                 try:
-                    # wait_nrc=False：发完 3E 80 不等待回包，直接继续发下一条 36
-                    with client.suppress_positive_response(wait_nrc=False):
-                        client.tester_present()
+                    _flash_tester_present_between_blocks(client, log)
                     if not keepalive_logged:
                         log(
-                            "刷写保活: 已启用周期性 TesterPresent（3E 80），固定每 %.0fs"
+                            "刷写保活: 块间隙空闲超过 %.0fs 时发 TesterPresent（3E 80），"
+                            "且必须收齐/排空后再发下一块 36"
                             % _FLASH_KEEPALIVE_INTERVAL_SEC
                         )
                         keepalive_logged = True
                 except Exception as exc:
                     log("刷写保活 TesterPresent 失败: %s" % exc)
-                while next_keepalive <= now:
-                    next_keepalive += _FLASH_KEEPALIVE_INTERVAL_SEC
+                next_keepalive = time.monotonic() + _FLASH_KEEPALIVE_INTERVAL_SEC
+            read_start = time.monotonic()
             chunk = fp.read(payload)
             if not chunk:
                 break
+            read_sec = time.monotonic() - read_start
+            send_start = time.monotonic()
             client.transfer_data(seq, chunk)
+            send_sec = time.monotonic() - send_start
+            tool_gap = 0.0
+            if prev_block_done is not None:
+                tool_gap = send_start - prev_block_done
+            log(
+                "TransferData 块#0x%02X: ECU处理 %.3fs | 工具间隔 %.3fs | 读文件 %.3fs"
+                % (seq, send_sec, tool_gap, read_sec)
+            )
+            prev_block_done = time.monotonic()
             offset += len(chunk)
             seq = next_transfer_data_block_sequence(seq)
+            # 36/76 已刷新 S3：从本块完成时刻重新计时
+            next_keepalive = time.monotonic() + _FLASH_KEEPALIVE_INTERVAL_SEC
             if progress:
                 progress(bytes_done_before + offset, total_all)
 
     exit_data = fl.transfer_exit_data
-    # 使用 udsoncan 默认 send_request（use_server_timing 下首轮 min(request_timeout, ECU-P2)，通常 ~50ms）
+    # 使用 udsoncan 默认 send_request（P2 取 ECU 宣告值或配置 p2_timeout，见 uds.use_server_timing）
     client.request_transfer_exit(exit_data if exit_data else None)
     log("RequestTransferExit OK file=%s" % item.name)
     return total
+
+
+def _inject_signatures_for_rid_0202(
+    steps: Sequence[RoutineStep], items: Sequence[TransferItem], log: LogFn
+) -> List[RoutineStep]:
+    """
+    北汽 v515：31 01 0202（完整性校验）RoutineControl option record 为对应文件的
+    256 字节 RSA 签名（来自 5-*.xml）。data 留空的 0202 步骤按传输顺序依次填充
+    （S19 先、ZIP 后）；文件缺签名时直接报错（v515 验签必须提供签名，不回退 CRC32）。
+    """
+    payload_iter = iter(
+        _require_item_signature(item) for item in items
+    )
+    out: List[RoutineStep] = []
+    for step in steps:
+        rid = int(step.routine_id) & 0xFFFF
+        if rid == 0x0202 and not bytes(step.data or b""):
+            payload = next(payload_iter, None)
+            if payload is None:
+                raise RuntimeError(
+                    "RoutineControl 0x0202 步骤数超过传输文件数（%d）" % len(items)
+                )
+            log(
+                "RoutineControl 0x0202 自动填充 256 字节 RSA 签名（%s...）"
+                % payload[:8].hex().upper()
+            )
+            out.append(
+                RoutineStep(
+                    routine_id=step.routine_id,
+                    control_type=step.control_type,
+                    data=payload,
+                )
+            )
+        else:
+            out.append(step)
+    return out
+
+
+def _require_item_signature(item: TransferItem) -> bytes:
+    if item.signature is None:
+        raise RuntimeError(
+            "文件 %s 缺少 256 字节 RSA 签名（5-*.xml 未匹配）。v515 验签必须提供签名，不回退 CRC32。"
+            % item.name
+        )
+    return item.signature
 
 
 def _run_flash_download_items(
@@ -943,6 +1304,8 @@ def _run_flash_download_items(
         log,
         cancel,
         state,
+        sec_levels=sec_levels,
+        l1_to_l3_delay_sec=sec_l1_l3_delay,
     )
     if cancel.is_set():
         raise FlashAborted("cancelled")
@@ -993,15 +1356,8 @@ def _run_flash_download_items(
         )
         done += n
 
-    has_dd02_in_cfg = any(
-        int(step.routine_id) == 0xDD02 and int(step.control_type) == 1
-        for step in fl.post_transfer_routines
-    )
-    dd02_from_zip = bool(dd02_signature and not has_dd02_in_cfg)
     need_post_download_session = bool(
-        fl.post_transfer_routines
-        or fl.post_transfer_raw_requests
-        or dd02_from_zip
+        fl.post_transfer_routines or fl.post_transfer_raw_requests
     )
     # RequestTransferExit 后许多 ECU 实际会话已回到默认或非编程会话，但 FlashFlowState
     # 仍记着 programming → _ensure_session 会误判跳过 10 02。
@@ -1016,31 +1372,24 @@ def _run_flash_download_items(
             l1_to_l3_delay_sec=sec_l1_l3_delay,
         )
 
-    if dd02_from_zip:
-        log(
-            "RoutineControl 0xDD02 type=1 (携带 XML 签名, len=%d bytes)" % len(dd02_signature)
-        )
-        client.routine_control(routine_id=0xDD02, control_type=1, data=dd02_signature)
-        _reassert_programming_session_and_unlock(
-            client,
-            sec_levels,
-            state,
-            cancel,
-            log,
-            reason="DD02(签名验签)长例程完成后",
-            l1_to_l3_delay_sec=sec_l1_l3_delay,
-        )
+    post_steps = list(fl.post_transfer_routines or [])
+    if post_steps and any(
+        (int(s.routine_id) & 0xFFFF) == 0x0202 and not bytes(s.data or b"")
+        for s in post_steps
+    ):
+        post_steps = _inject_signatures_for_rid_0202(post_steps, items, log)
 
     _run_routines(
         client,
-        fl.post_transfer_routines,
+        post_steps,
         log,
         cancel,
         state,
         sec_levels_reunlock_after_rid_dd02=(
-            tuple(sec_levels) if fl.post_transfer_routines else None
+            tuple(sec_levels) if post_steps else None
         ),
         l1_to_l3_delay_sec=sec_l1_l3_delay,
+        dd02_signature=dd02_signature,
     )
     _run_raw_requests(
         client,
@@ -1055,7 +1404,7 @@ def _run_flash_download_items(
         assert reconnect_after_ecu_reset is not None
         dly = fl.post_transfer_reconnect_delay_sec
         if dly is not None:
-            log("后编程: 配置了复位后延迟 %.1fs（由重连逻辑执行后再发剩余请求）" % float(dly))
+            log("后编程: 配置了 DD03 后等待 %.1fs（由重连逻辑执行后再发剩余请求）" % float(dly))
         client = reconnect_after_ecu_reset()
         reconnect_state = FlashFlowState()
         _run_raw_requests(
@@ -1108,11 +1457,16 @@ def run_flash_download_from_path(
     path = Path(firmware_path)
     t0 = time.monotonic()
     log("刷写准备: 开始解析文件并准备传输项…")
-    with tempfile.TemporaryDirectory(prefix="doip_flash_") as td:
-        items, dd02_signature = _prepare_transfer_items_from_path(path, Path(td), log)
+    try:
+        items, dd02_signature = _prepare_transfer_items_from_path(path, log)
         log(
-            "刷写准备: 完成，共 %d 个传输文件，总大小=%d bytes，耗时=%.2fs"
-            % (len(items), sum(x.size for x in items), time.monotonic() - t0)
+            "刷写准备: 完成，共 %d 个传输文件，总大小=%d bytes，DD02签名=%s，耗时=%.2fs"
+            % (
+                len(items),
+                sum(x.size for x in items),
+                "%d bytes" % len(dd02_signature) if dd02_signature else "无",
+                time.monotonic() - t0,
+            )
         )
         _run_flash_download_items(
             client,
@@ -1124,3 +1478,6 @@ def run_flash_download_from_path(
             progress=progress,
             reconnect_after_ecu_reset=reconnect_after_ecu_reset,
         )
+    finally:
+        # 清理解压外层 DoIP 包产生的临时目录
+        _cleanup_extracted_dirs()

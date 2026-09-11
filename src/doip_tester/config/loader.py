@@ -83,6 +83,8 @@ def app_config_to_dict(cfg: AppConfig) -> Dict[str, Any]:
         uds["security_key_level1"] = cfg.uds.security_key_level1.hex().upper()
     if cfg.uds.security_key_level3:
         uds["security_key_level3"] = cfg.uds.security_key_level3.hex().upper()
+    if cfg.uds.security_algorithm:
+        uds["security_algorithm"] = cfg.uds.security_algorithm
 
     diagnostics: Dict[str, Any] = {
         "dids": list(cfg.diagnostics.dids),
@@ -185,6 +187,8 @@ def app_config_to_dict(cfg: AppConfig) -> Dict[str, Any]:
         flash["security_access_levels_before_download"] = list(
             cfg.flash.security_access_levels_before_download
         )
+    if cfg.flash.transfer_security_level is not None:
+        flash["transfer_security_level"] = cfg.flash.transfer_security_level
 
     return {
         "network": net,

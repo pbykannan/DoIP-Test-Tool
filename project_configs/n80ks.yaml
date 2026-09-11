@@ -1,0 +1,234 @@
+# 北汽 N80KS TBOX（v515 doip-process / Linux）陪测配置
+# 依据：
+#  - v515 服务端 config.xml（逻辑地址/会话/服务/RID/DID 约束）
+#  - N80KS TBX 诊断协议 V1.0（Service/Routines/System DID/Flash sheet）
+#  - 《UDS安全访问认证方案 v2.0》+《密钥因子_TBOX_N80KS》（level1=UDS因子 / level3=BOOT因子）
+network:
+  host: "192.168.10.43"
+  tcp_port: 13400
+  udp_port: 13400
+  client_bind_ip: null
+
+doip:
+  client_logical_address: 0x0E80
+  server_logical_address: 0x002B
+  protocol_version: 3
+  socket_read_timeout: 15
+  activation_type: "Default"
+  activation_disabled: false
+  vm_specific: 0
+  uds_addressing: "physical"
+  functional_logical_address: 0xE400
+
+uds:
+  request_timeout: 30
+  # use_server_timing=true：进入会话后采用 ECU 在 0x10 响应中宣告的 P2/P2*；
+  # p2_timeout 仅作为未取得 ECU 时间参数前的兜底。
+  # 注意：若 ECU 宣告 P2=50ms 但实际 NRC 78 常 60ms+ 才回，应改回
+  # use_server_timing=false + p2_timeout=0.5 以本地超时等待。
+  use_server_timing: false
+  p2_timeout: 0.05
+  p2_star_timeout: 5
+  server_address_format: null
+  server_memorysize_format: null
+  # 北汽 v2.0 认证：SK=CMAC(Key, DF)，Token=CMAC(SK, Seed)，27 02 上传 32 字节 DF||Token
+  security_algorithm: "baic-df-token"
+  # 密钥因子（16 字节）：UDS 因子=level1（27 01/02）；BOOT 因子=level3（27 11/12）
+  security_key_level1: "F66EF1DE91B987096FEF02AFE2307FC6"
+  security_key_level3: "9848BFCD817E43449312039EA703DB79"
+
+diagnostics:
+  # 诊断树（仅 UI 左侧“服务树”）；来源：N80KS TBX 诊断协议 V1.0
+  service_presets:
+    - sid: 0x10
+      items:
+        - request: "1001"
+          comment: "默认会话"
+        - request: "1002"
+          comment: "编程会话"
+        - request: "1003"
+          comment: "扩展会话"
+    - sid: 0x11
+      items:
+        - request: "1101"
+          comment: "硬复位(触发OTA)"
+        - request: "1103"
+          comment: "软复位"
+    - sid: 0x14
+      items:
+        - request: "14FFFFFF"
+          comment: "清除全部 DTC"
+    - sid: 0x19
+      items:
+        - request: "1901FF"
+          comment: "按状态掩码读 DTC 数量"
+        - request: "1902FF"
+          comment: "按状态掩码读 DTC 列表"
+        - request: "1903"
+          comment: "读快照标识"
+        - request: "1904FFFFFF01"
+          comment: "按 DTC 读快照记录"
+        - request: "190AFF"
+          comment: "读支持的 DTC"
+    - sid: 0x22
+      items:
+        - request: "22F183"
+          comment: "Bootloader软件版本号"
+        - request: "22F184"
+          comment: "应用软件指纹"
+        - request: "22F187"
+          comment: "零部件号"
+        - request: "22F18A"
+          comment: "供应商代码"
+        - request: "22F190"
+          comment: "VIN"
+        - request: "22F191"
+          comment: "ECU 硬件版本号"
+        - request: "22F195"
+          comment: "ECU 软件版本号"
+        - request: "22F1A1"
+          comment: "车辆配置"
+        - request: "220900"
+          comment: "T-Box 硬线唤醒状态"
+        - request: "22F1A3"
+          comment: "ECU名称"
+    - sid: 0x27
+      items:
+        - request: "2701"
+          comment: "请求 Seed(L1/UDS因子)"
+        - request: "2702"
+          comment: "发送 Key(L1)"
+        - request: "2711"
+          comment: "请求 Seed(L3/BOOT因子)"
+        - request: "2712"
+          comment: "发送 Key(L3)"
+    - sid: 0x28
+      items:
+        - request: "280000"
+          comment: "使能接收和发送(commType=00)"
+        - request: "280001"
+          comment: "使能接收和发送(普通通信NCM)"
+        - request: "280003"
+          comment: "使能接收和发送(普通+网络管理通信)"
+        - request: "280301"
+          comment: "禁止接收和发送(普通通信NCM)"
+    - sid: 0x2E
+      items:
+        - request: "2EF184"
+          comment: "写应用软件指纹(9字节: 年月日BCD+6字节串号)"
+        - request: "2EF190"
+          comment: "写 VIN"
+    - sid: 0x31
+      items:
+        - request: "31010203"
+          comment: "预编程条件检查 0x0203"
+        - request: "31010202"
+          comment: "完整性校验 0x0202(256B签名/CRC32)"
+        - request: "3101FF00"
+          comment: "擦除内存 FF00"
+        - request: "3101FF01"
+          comment: "检查依赖 FF01"
+        - request: "31010202"
+          comment: "读取例程结果 0x0202(控制类型03)"
+    - sid: 0x3E
+      items:
+        - request: "3E00"
+          comment: "TesterPresent"
+        - request: "3E80"
+          comment: "TesterPresent（抑制正响应）"
+    - sid: 0x85
+      items:
+        - request: "8501"
+          comment: "DTC Setting ON"
+        - request: "8502"
+          comment: "DTC Setting OFF"
+        - request: "8581"
+          comment: "DTC Setting ON（抑制正响应）"
+        - request: "8582"
+          comment: "DTC Setting OFF（抑制正响应）"
+
+flash:
+  # v515：34 地址/长度各 4 字节（响应 lengthFormatIdentifier=0x40），地址字段服务端未使用
+  memory_address: 0
+  address_format: 32
+  memorysize_format: 32
+  override_block_payload: null
+  post_request_download_delay_sec: 0.35
+  security_l1_to_l3_delay_sec: 0.35
+  transfer_exit_data: null
+  # 34/36/37 需要 Level3（TBX 表：RequestDownload/TransferData/RequestTransferExit = 02 会话 + level_3）
+  transfer_security_level: 0x11
+  # Pre-programming（extended 会话内，会话自动先切 10 03）
+  # 依据 Q/BAIC C230039 图7/9.2.2：预编程 (c) 85 02、(d) 28 03 01 使用功能寻址；
+  # 28 03 01 = disableNonDiagnosticCom（controlType=0x03 disableRxAndTx + commType=0x01 NCM），
+  # 注意不是 28 00 03（那是 enable）。功能寻址请求按 suppress 语义（无应答视为成功）。
+  pre_transfer_raw_requests:
+    - "31010203"   # (b) checkProgrammingPreconditions（物理寻址，extended 会话）
+    - payload: "8502"       # (c) ControlDTCSetting off（功能寻址）
+      addressing: functional
+    - payload: "280301"     # (d) CommunicationControl disableNonDiagnosticCom（功能寻址）
+      addressing: functional
+  pre_transfer_routines: []
+  # Programming session
+  diagnostic_sessions_before_download:
+    - extended
+    - programming
+  # L1(UDS因子) 在 extended 会话解锁（TBX 表 27 01/02=03 会话）；L3(BOOT因子) 在编程会话
+  security_access_levels_before_download:
+    - 0x01
+    - 0x11
+  # 2E F184 应用软件指纹（9 字节：年/月/日 BCD + 诊断仪串号 6 字节 ASCII，programming+level_3）
+  fingerprint_did: 0xF184
+  fingerprint_data: "260810414243444546"
+  # Post-download：S19/ZIP 两文件传完后依次 0202(S19 签名)→0202(ZIP 签名)→FF00→FF01
+  # 0202 校验信息自动填充：解析目录内 5-*.xml 的 256 字节 RSA 签名（正规流程）。
+  # 文件选择时自动配对 1-*.s19 + 2-*.zip + 5-*.xml；缺少签名清单或签名不匹配将直接报错（不回退 CRC32）。
+  post_transfer_routines:
+    - routine_id: 0x0202
+      control_type: 1
+      data: ""      # 自动填充第 1 个传输文件（S19）签名
+    - routine_id: 0x0202
+      control_type: 1
+      data: ""      # 自动填充第 2 个传输文件（ZIP）签名
+    - routine_id: 0xFF00
+      control_type: 1
+      data: ""      # 擦除内存（服务端直接成功）
+    - routine_id: 0xFF01
+      control_type: 1
+      data: ""      # 检查编程依赖（服务端直接成功）
+  # 后编程（依据 Q/BAIC C230039 图9 / 9.2.4 完整执行，不复位不结束）：
+  #   (a) 11 01 硬复位触发 OTA 升级
+  #   (b) 等待 PHY 重建数据连接（诊断仪周期发送车辆发现请求，周期 100ms×50 次；工具按
+  #       post_transfer_reconnect_delay_sec 轮询重连直到设备就绪）
+  #   (c) 10 03 扩展会话（功能寻址）
+  #   (d) 28 00 01 恢复网络正常通信（功能寻址）
+  #   (e) 85 01 恢复 DTC 设置（功能寻址）
+  #   (f) 10 01 返回默认会话（功能寻址）
+  #   (g) 14 FF FF FF 清除 DTC（功能寻址）
+  # 功能寻址请求按 suppress 语义处理：无应答视为成功。
+  post_transfer_raw_requests:
+    - "1101"
+  post_transfer_reconnect_delay_sec: 350
+  post_transfer_after_reconnect_raw_requests:
+    - payload: "1003"
+      addressing: functional
+    - payload: "280001"
+      addressing: functional
+    - payload: "8501"
+      addressing: functional
+    - payload: "1001"
+      addressing: functional
+    - payload: "14FFFFFF"
+      addressing: functional
+
+
+
+
+
+
+
+
+
+
+
+

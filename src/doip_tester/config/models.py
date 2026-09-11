@@ -50,11 +50,16 @@ class UdsConfig:
     request_timeout: float = 5.0
     p2_timeout: float = 1.0
     p2_star_timeout: float = 5.0
+    # True=采用 ECU 在 10 会话响应里宣告的 P2/P2*（ISO 标准行为）；False=一律用上面配置的 p2_timeout/p2_star_timeout
+    use_server_timing: bool = True
     server_address_format: Optional[int] = None
     server_memorysize_format: Optional[int] = None
     # 0x27 SecurityAccess（AES-128-CMAC）：level 0x01 / 0x11 各一把；不配则用代码内参考默认值
     security_key_level1: Optional[bytes] = None
     security_key_level3: Optional[bytes] = None
+    # 27 算法族：cmac-chery（奇瑞 v116：key=CMAC(secret, seed)）| baic-df-token（北汽 v2.0：
+    # SK=CMAC(Key, DF)，Token=CMAC(SK, seed)，27 02 上传 DF||Token 32 字节）
+    security_algorithm: str = "cmac-chery"
 
 
 @dataclass
@@ -120,6 +125,8 @@ class FlashConfig:
     diagnostic_sessions_before_download: List[str] = field(default_factory=list)
     # 覆盖刷写内置默认解锁级别；留空则 transfer 内默认为 L3（[0x11]）
     security_access_levels_before_download: List[int] = field(default_factory=list)
+    # 34 RequestDownload 前确保的安全级别；null 用代码默认 0x01（v116 用 L1，北汽 v515 用 L3）
+    transfer_security_level: Optional[int] = None
 
 
 @dataclass
@@ -354,6 +361,7 @@ class AppConfig:
                 request_timeout=float(u.get("request_timeout", 5)),
                 p2_timeout=float(u.get("p2_timeout", 1)),
                 p2_star_timeout=float(u.get("p2_star_timeout", 5)),
+                use_server_timing=bool(u.get("use_server_timing", True)),
                 server_address_format=(
                     int(u["server_address_format"])
                     if u.get("server_address_format") is not None
@@ -370,6 +378,7 @@ class AppConfig:
                 security_key_level3=_uds_secret_key_16(
                     "security_key_level3", u.get("security_key_level3")
                 ),
+                security_algorithm=str(u.get("security_algorithm", "cmac-chery")),
             ),
             diagnostics=DiagnosticsConfig(
                 dids=[int(x) for x in (diag.get("dids") or [])],
@@ -406,5 +415,10 @@ class AppConfig:
                 post_transfer_after_reconnect_raw_requests=post_after_re_raw,
                 diagnostic_sessions_before_download=_sess_list,
                 security_access_levels_before_download=_sec_levels,
+                transfer_security_level=(
+                    int(fl["transfer_security_level"])
+                    if fl.get("transfer_security_level") is not None
+                    else None
+                ),
             ),
         )

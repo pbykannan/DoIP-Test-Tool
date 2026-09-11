@@ -1,4 +1,5 @@
 import copy
+import os
 from typing import Callable, Optional
 
 from doipclient import DoIPClient
@@ -47,6 +48,47 @@ def _make_chery_v116_security_algo(key_level1: bytes, key_level3: bytes):
     return _algo
 
 
+def baic_v2_derive_session_key(key: bytes, df: bytes) -> bytes:
+    """北汽 v2.0：SK = AES-128-CMAC(Key, DF)（PDF 附录 A.2.4）。"""
+    return _aes128_cmac(key, df)
+
+
+def baic_v2_compute_token(sk: bytes, seed: bytes) -> bytes:
+    """北汽 v2.0：Token = AES-128-CMAC(SK, Seed)（PDF 附录 A.2.4）。"""
+    return _aes128_cmac(sk, seed)
+
+
+def _make_baic_v2_security_algo(
+    key_level1: bytes,
+    key_level3: bytes,
+    df_source: Optional[Callable[[int], bytes]] = None,
+):
+    """
+    北汽《UDS安全访问认证方案 v2.0》：
+      1) Tester 发 27 01/11 -> ECU 返回 16 字节随机 Seed；
+      2) Tester 生成 16 字节派生因子 DF；
+      3) SK = AES-CMAC(Key, DF)；
+      4) Token = AES-CMAC(SK, Seed)；
+      5) 27 02/12 上传 32 字节 DF||Token。
+    level 0x01 用 UDS 密钥因子，level 0x11 用 BOOT 密钥因子。
+    ``df_source`` 仅测试用；缺省为 os.urandom。
+    """
+
+    def _algo(seed: bytes, level: int, params=None) -> bytes:
+        seed_b = bytes(seed or b"")
+        if len(seed_b) != 16:
+            raise ValueError(
+                "北汽 v2.0 认证要求 16 字节 Seed，收到 %d 字节" % len(seed_b)
+            )
+        key = key_level3 if int(level) == 0x11 else key_level1
+        df = df_source(16) if df_source is not None else os.urandom(16)
+        sk = baic_v2_derive_session_key(key, df)
+        token = baic_v2_compute_token(sk, seed_b)
+        return df + token
+
+    return _algo
+
+
 def build_uds_client(
     doip: DoIPClient,
     cfg: AppConfig,
@@ -67,8 +109,8 @@ def build_uds_client(
     ucfg["request_timeout"] = u.request_timeout
     ucfg["p2_timeout"] = u.p2_timeout
     ucfg["p2_star_timeout"] = u.p2_star_timeout
-    # 按协议使用 ECU 宣告的 P2/P2*（server timing）
-    ucfg["use_server_timing"] = True
+    # True=使用 ECU 宣告的 P2/P2*；False=用配置的 p2_timeout/p2_star_timeout（部分 ECU 宣告的 P2 过短，实际响应更慢）
+    ucfg["use_server_timing"] = u.use_server_timing
     if u.server_address_format is not None:
         ucfg["server_address_format"] = u.server_address_format
     if u.server_memorysize_format is not None:
@@ -78,7 +120,13 @@ def build_uds_client(
     # "Client configuration does not provide a security algorithm"
     k1 = u.security_key_level1 or _DEFAULT_KEY_LEVEL1
     k3 = u.security_key_level3 or _DEFAULT_KEY_LEVEL3
-    ucfg["security_algo"] = _make_chery_v116_security_algo(k1, k3)
+    algo_name = str(u.security_algorithm or "cmac-chery").strip().lower()
+    if algo_name == "baic-df-token" or algo_name == "baic_v2":
+        ucfg["security_algo"] = _make_baic_v2_security_algo(k1, k3)
+    elif algo_name in ("cmac-chery", "chery", ""):
+        ucfg["security_algo"] = _make_chery_v116_security_algo(k1, k3)
+    else:
+        raise ValueError("uds.security_algorithm 未知: %r" % u.security_algorithm)
     ucfg["security_algo_params"] = None
     client = Client(conn, config=ucfg, request_timeout=u.request_timeout)
     return client

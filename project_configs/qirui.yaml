@@ -185,7 +185,7 @@ diagnostics:
         - request: "3101DD01"
           comment: "保持在 Boot"
         - request: "3101DD02"
-          comment: "验签例程 DD02（运行时会拼签名参数）"
+          comment: "验签例程 DD02（运行时从 .rsa 解析 384 字节签名拼入）"
         - request: "3101DD03"
           comment: "后处理 DD03"
         - request: "3101FF00"
@@ -245,17 +245,20 @@ flash:
   # 2E F184 fingerprint（v116 固定 19 bytes）
   fingerprint_did: 0xF184
   fingerprint_data: "112233445566778899AABBCCDDEEFF00112233"
-  # Post-download routines
+  # Post-download：CBF/RSA 双文件传完后，DD02(31 01 DD 02 + 384B 签名) → FF01 → DD03
   post_transfer_routines:
+    - routine_id: 0xDD02
+      control_type: 1
+      data: ""
     - routine_id: 0xFF01
       control_type: 1
       data: ""
     - routine_id: 0xDD03
       control_type: 1
       data: ""
-  # Post-programming：DD03 完成后 TBOX 自行复位，不再发 11 01
+  # DD03 完成后 TBOX 自行进入升级/复位，此处不再发 11 01 或通信恢复（升级中不可硬复位）
   post_transfer_raw_requests: []
-  # DD03 触发的自动复位后，等对端升级就绪再起 TCP（实测可能数分钟量级）
+  # DD03 触发的升级/复位完成后，等对端就绪再起 TCP（实测可能数分钟量级）
   post_transfer_reconnect_delay_sec: 350
   # 重连后继续（扩展会话清理等）
   post_transfer_after_reconnect_raw_requests:

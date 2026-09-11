@@ -174,6 +174,14 @@ class DiagnosticService:
         self._log("SecurityAccess unlock try level=0x%02X (依赖算法算 key)" % level)
         try:
             resp = self._client.unlock_security_access(level)
+            sd = getattr(resp, "service_data", None)
+            seed = getattr(sd, "seed", None)
+            if seed is not None and len(seed) > 0 and seed == b"\x00" * len(seed):
+                self._log(
+                    "SecurityAccess: 对端返回全 0 seed → level 0x%02X 已解锁，27 02 未发送（正常）"
+                    % level
+                )
+                return
             self._log_generic_response(resp, label="SecurityAccess unlock")
         except Exception as exc:
             self._log("SecurityAccess unlock failed: %s" % exc)

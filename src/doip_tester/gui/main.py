@@ -21,7 +21,7 @@ from doip_tester.projects import (
     read_first_bundled_project_yaml_text,
     read_first_project_yaml_text,
 )
-from doip_tester.flash.transfer import FlashAborted, run_flash_download_from_path
+from doip_tester.flash.transfer import FlashAborted, generate_dummy_rsa, run_flash_download_from_path
 from doip_tester.gui.preset_actions import (
     build_preset_tree,
     is_preset_leaf,
@@ -493,6 +493,10 @@ class DoIPTesterApp(tk.Tk):
             pick_row, text="📁 选目录…", command=self._browse_fw_dir
         )
         self._flash_choose_dir_btn.pack(side=tk.LEFT)
+        self._gen_rsa_btn = ttk.Button(
+            pick_row, text="🔑 生成临时RSA", command=self._generate_dummy_rsa
+        )
+        self._gen_rsa_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         self._prog_wrap = ttk.Frame(flash)
         self._prog_wrap.pack(fill=tk.X, pady=(14, 8))
@@ -500,6 +504,33 @@ class DoIPTesterApp(tk.Tk):
             self._prog_wrap, mode="determinate", length=400, style="Flash.Horizontal.TProgressbar"
         )
         self._prog.pack(fill=tk.X)
+
+        cycle_row = ttk.Frame(flash)
+        cycle_row.pack(fill=tk.X, pady=(6, 0))
+        self._flash_cycle_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            cycle_row,
+            text="周期升级",
+            variable=self._flash_cycle_enabled,
+            command=self._on_flash_cycle_toggle,
+        ).pack(side=tk.LEFT)
+        ttk.Label(cycle_row, text="次数").pack(side=tk.LEFT, padx=(10, 4))
+        self._flash_cycle_count_var = tk.StringVar(value="1")
+        self._flash_cycle_count_entry = ttk.Entry(
+            cycle_row, textvariable=self._flash_cycle_count_var, width=5
+        )
+        self._flash_cycle_count_entry.pack(side=tk.LEFT)
+        ttk.Label(cycle_row, text="间隔(s)").pack(side=tk.LEFT, padx=(10, 4))
+        self._flash_cycle_interval_var = tk.StringVar(value="5")
+        self._flash_cycle_interval_entry = ttk.Entry(
+            cycle_row, textvariable=self._flash_cycle_interval_var, width=5
+        )
+        self._flash_cycle_interval_entry.pack(side=tk.LEFT)
+        self._flash_cycle_status = ttk.Label(
+            cycle_row, text="", foreground=self._theme_hint, font=("Segoe UI", 8)
+        )
+        self._flash_cycle_status.pack(side=tk.LEFT, padx=(10, 0))
+        self._on_flash_cycle_toggle()
 
         flash_actions = ttk.Frame(flash)
         flash_actions.pack(fill=tk.X, pady=(4, 0))
@@ -582,6 +613,14 @@ class DoIPTesterApp(tk.Tk):
         self._main_pane_minsize_key: Optional[tuple[int, int]] = None
         self._manual_compact_layout = False
         self._manual_hex_resize_job: Optional[Any] = None
+        self._flash_cycle_active = False
+        self._flash_cycle_total = 1
+        self._flash_cycle_index = 0
+        self._flash_cycle_ok = 0
+        self._flash_cycle_fail = 0
+        self._flash_cycle_path = ""
+        self._flash_cycle_interval_sec = 5.0
+        self._flash_cycle_after_id: Optional[Any] = None
 
     def _enqueue_main_pane_limits_on_paned_width_change(self, evt=None) -> None:
         """仅在主区 PanedWindow 总宽变化明显时排队调整，过滤子控件重绘导致的重复事件。"""
@@ -996,7 +1035,8 @@ class DoIPTesterApp(tk.Tk):
         self._set_project_watch(path, text)
         self._refresh_pc_ips(emit_log=log)
         if log:
-            self._emit_log("已加载项目: %s" % name)
+            self._emit_log("已加载项目: %s  <- %s" % (name, path))
+            self._emit_log(self._describe_effective_uds(cfg))
 
     def _on_project_selected(self, _evt: Optional[tk.Event] = None) -> None:
         name = self._project_var.get()
@@ -1100,14 +1140,7 @@ class DoIPTesterApp(tk.Tk):
                         self._disconn_btn.configure(state=tk.DISABLED)
                         self._update_addr_effective_hint()
                     elif kind == "flash_done":
-                        self._flash_btn.configure(state=tk.NORMAL)
-                        self._cancel_flash_btn.configure(state=tk.DISABLED)
-                        self._update_progress_text(
-                            int(float(self._prog["value"])),
-                            int(float(self._prog["maximum"])),
-                        )
-                        if self._tp_var.get():
-                            self._start_tp()
+                        self._on_flash_cycle_done(payload)
                     elif kind == "tp_done":
                         # 上一帧 TP 结束后再等 2s 发下一帧，避免队列里堆满 tp_tick
                         if self._tp_active:
@@ -1171,7 +1204,8 @@ class DoIPTesterApp(tk.Tk):
                 text
             )
             self._watch_project_mtime_ns = mtime_ns
-            self._emit_log("检测到配置变化，已刷新 YAML 和服务树。")
+            self._emit_log("检测到配置变化，已刷新 YAML 和服务树。 <- %s" % path)
+            self._emit_log(self._describe_effective_uds(cfg))
         except Exception as exc:
             self._watch_project_mtime_ns = mtime_ns
             messagebox.showerror("配置", "配置刷新失败：\n%s" % exc)
@@ -1240,6 +1274,34 @@ class DoIPTesterApp(tk.Tk):
             self._v_functional_la.get().strip(), 0
         )
         return cfg
+
+    @staticmethod
+    def _describe_effective_uds(cfg: AppConfig) -> str:
+        """生成一行描述：当前生效的 UDS 定时/寻址等关键项，便于确认配置是否真正生效。"""
+        try:
+            u = cfg.uds
+            d = cfg.doip
+            part = (
+                "生效配置: host=%s:%d 寻址=%s target=0x%04X "
+                "use_server_timing=%s p2_timeout=%.3fs p2*=%.3fs request_timeout=%.0fs"
+                % (
+                    cfg.network.host,
+                    cfg.network.tcp_port,
+                    d.uds_addressing,
+                    int(d.functional_logical_address)
+                    if d.uds_addressing == "functional"
+                    else int(d.server_logical_address),
+                    u.use_server_timing,
+                    u.p2_timeout,
+                    u.p2_star_timeout,
+                    u.request_timeout,
+                )
+            )
+            if u.use_server_timing:
+                part += "  [提示: server_timing 开启时实际 P2/P2* 取 ECU 0x10 响应宣告值，配置值仅作兜底]"
+            return part
+        except Exception:
+            return "生效配置: (解析失败)"
 
     def _enqueue(self, cmd: str, **kwargs: Any) -> None:
         self._cmd_queue.put((cmd, dict(kwargs)))
@@ -1387,14 +1449,17 @@ class DoIPTesterApp(tk.Tk):
                 raise ValueError("无效的 hex")
             self._require_diag().send_raw_payload(data)
         elif cmd == "flash":
+            status = "ok"
             try:
                 self._do_flash(args["cfg"], args["path"])
             except FlashAborted:
+                status = "abort"
                 self._emit_log("刷写已中止")
             except Exception as exc:
+                status = "fail"
                 self._emit_log("刷写失败: %s" % exc)
             finally:
-                self._ui_queue.put(("flash_done", None))
+                self._ui_queue.put(("flash_done", status))
         elif cmd == "tp_tick":
             if not self._tp_active:
                 return
@@ -1587,7 +1652,13 @@ class DoIPTesterApp(tk.Tk):
 
     def _browse_fw(self) -> None:
         p = filedialog.askopenfilename(
-            filetypes=[("Binary/Package", "*.bin;*.hex;*.zip;*.*"), ("All", "*.*")]
+            filetypes=[
+                ("DoIP Package zip (内含s19+xml+zip)", "*.zip"),
+                ("S19/ZIP/XML (v515)", "*.s19;*.zip;*.xml"),
+                ("CBF/RSA Package", "*.cbf;*.rsa"),
+                ("Binary", "*.bin;*.hex"),
+                ("All", "*.*"),
+            ]
         )
         if p:
             self._fw_path.set(p)
@@ -1596,6 +1667,233 @@ class DoIPTesterApp(tk.Tk):
         p = filedialog.askdirectory()
         if p:
             self._fw_path.set(p)
+
+    def _generate_dummy_rsa(self) -> None:
+        path = self._fw_path.get().strip()
+        if not path:
+            messagebox.showwarning("生成临时RSA", "请先在上方选择 .cbf 文件或包含 .cbf 的目录")
+            return
+        p = Path(path)
+        try:
+            if p.is_dir():
+                cbfs = [f for f in p.iterdir() if f.suffix.lower() == ".cbf"]
+                if not cbfs:
+                    messagebox.showerror("生成临时RSA", "目录内未找到 .cbf 文件: %s" % p)
+                    return
+                cbf = max(cbfs, key=lambda f: f.stat().st_size)
+            elif p.is_file() and p.suffix.lower() == ".cbf":
+                cbf = p
+            elif p.is_file() and p.suffix.lower() == ".rsa":
+                cbf = p.with_suffix(".cbf")
+                if not cbf.is_file():
+                    messagebox.showerror("生成临时RSA", "对应的 .cbf 不存在: %s" % cbf)
+                    return
+            else:
+                messagebox.showwarning("生成临时RSA", "请选择 .cbf 文件或包含 .cbf 的目录")
+                return
+            rsa = generate_dummy_rsa(cbf)
+            self._emit_log("已生成临时 RSA: %s（384 字节全 0xFF 占位签名）" % rsa)
+            messagebox.showinfo("生成临时RSA", "已生成:\n%s\n\n384 字节全 0xFF 占位签名，仅用于 server 跳过签名校验时。" % rsa)
+        except Exception as exc:
+            messagebox.showerror("生成临时RSA", "生成失败: %s" % exc)
+
+    def _on_flash_cycle_toggle(self) -> None:
+        enabled = bool(self._flash_cycle_enabled.get())
+        st = tk.NORMAL if enabled else tk.DISABLED
+        try:
+            self._flash_cycle_count_entry.configure(state=st)
+            self._flash_cycle_interval_entry.configure(state=st)
+        except Exception:
+            pass
+
+    def _parse_flash_cycle_options(self) -> Tuple[int, float]:
+        """返回 (次数, 间隔秒)。未勾选周期时次数恒为 1。"""
+        if not self._flash_cycle_enabled.get():
+            return 1, 0.0
+        try:
+            count = int(str(self._flash_cycle_count_var.get()).strip() or "1")
+        except ValueError:
+            count = 1
+        count = max(1, min(count, 9999))
+        try:
+            interval = float(str(self._flash_cycle_interval_var.get()).strip() or "0")
+        except ValueError:
+            interval = 0.0
+        interval = max(0.0, min(interval, 3600.0))
+        return count, interval
+
+    def _cancel_flash_cycle_timer(self) -> None:
+        job = getattr(self, "_flash_cycle_after_id", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+            self._flash_cycle_after_id = None
+
+    def _set_flash_cycle_status(self, text: str) -> None:
+        try:
+            self._flash_cycle_status.configure(text=text)
+        except Exception:
+            pass
+
+    def _flash_cycle_score_text(self) -> str:
+        return "成功 %d / 失败 %d" % (self._flash_cycle_ok, self._flash_cycle_fail)
+
+    def _finish_flash_ui(self) -> None:
+        self._flash_btn.configure(state=tk.NORMAL)
+        self._cancel_flash_btn.configure(state=tk.DISABLED)
+        self._update_progress_text(
+            int(float(self._prog["value"])),
+            int(float(self._prog["maximum"])),
+        )
+        if self._tp_var.get():
+            self._start_tp()
+
+    def _enqueue_flash_round(self) -> None:
+        """提交当前周期中的一轮刷写（主线程调用）。"""
+        path = self._flash_cycle_path
+        try:
+            cfg = self._effective_cfg()
+        except Exception as exc:
+            self._flash_cycle_fail += 1
+            self._emit_log(
+                "周期升级第 %d/%d 轮配置无效，已停止: %s（累计 %s）"
+                % (
+                    self._flash_cycle_index,
+                    self._flash_cycle_total,
+                    exc,
+                    self._flash_cycle_score_text(),
+                )
+            )
+            self._flash_cycle_active = False
+            self._set_flash_cycle_status("已停：%s" % self._flash_cycle_score_text())
+            self._finish_flash_ui()
+            return
+        self._flash_cancel.clear()
+        self._flash_btn.configure(state=tk.DISABLED)
+        self._cancel_flash_btn.configure(state=tk.NORMAL)
+        self._prog["value"] = 0
+        self._prog["maximum"] = 1
+        self._v_prog_text.set("0%")
+        self._update_progress_text(0, 1)
+        self._stop_tp(clear_checkbox=False)
+        self._drop_pending_tp_ticks()
+        if self._flash_cycle_total > 1:
+            self._set_flash_cycle_status(
+                "进行中 %d/%d（%s）"
+                % (
+                    self._flash_cycle_index,
+                    self._flash_cycle_total,
+                    self._flash_cycle_score_text(),
+                )
+            )
+            self._emit_log(
+                "周期升级：开始第 %d/%d 轮 …（当前累计 %s）"
+                % (
+                    self._flash_cycle_index,
+                    self._flash_cycle_total,
+                    self._flash_cycle_score_text(),
+                )
+            )
+        else:
+            self._set_flash_cycle_status("")
+            self._emit_log("刷写任务已提交，正在准备…")
+        self._enqueue("flash", cfg=cfg, path=path)
+
+    def _on_flash_cycle_done(self, status: Any) -> None:
+        """一轮刷写结束：成功则继续下一轮，失败/中止则停止周期。"""
+        result = str(status or "fail")
+        if result == "ok":
+            self._flash_cycle_ok += 1
+            if self._flash_cycle_total > 1 or self._flash_cycle_active:
+                self._emit_log(
+                    "周期升级：第 %d/%d 轮成功（累计 %s）"
+                    % (
+                        self._flash_cycle_index,
+                        self._flash_cycle_total,
+                        self._flash_cycle_score_text(),
+                    )
+                )
+        else:
+            self._flash_cycle_fail += 1
+
+        if not self._flash_cycle_active:
+            self._finish_flash_ui()
+            return
+
+        if result != "ok":
+            reason = "用户中止" if result == "abort" else "失败"
+            self._emit_log(
+                "周期升级已停止（%s）：计划 %d 轮，完成 %d 轮，%s"
+                % (
+                    reason,
+                    self._flash_cycle_total,
+                    self._flash_cycle_ok + self._flash_cycle_fail,
+                    self._flash_cycle_score_text(),
+                )
+            )
+            self._flash_cycle_active = False
+            self._set_flash_cycle_status("已停：%s" % self._flash_cycle_score_text())
+            self._finish_flash_ui()
+            return
+
+        if self._flash_cycle_index >= self._flash_cycle_total:
+            self._emit_log(
+                "周期升级全部完成：计划 %d 轮，%s"
+                % (self._flash_cycle_total, self._flash_cycle_score_text())
+            )
+            self._flash_cycle_active = False
+            self._set_flash_cycle_status("完成：%s" % self._flash_cycle_score_text())
+            self._finish_flash_ui()
+            return
+
+        # 还有下一轮：间隔后继续（保持中止按钮可用，以便间隔等待中也可取消）
+        self._flash_cycle_index += 1
+        delay = float(self._flash_cycle_interval_sec)
+        self._flash_btn.configure(state=tk.DISABLED)
+        self._cancel_flash_btn.configure(state=tk.NORMAL)
+        if delay > 0:
+            self._set_flash_cycle_status(
+                "等待下一轮 %d/%d（%.0fs，%s）…"
+                % (
+                    self._flash_cycle_index,
+                    self._flash_cycle_total,
+                    delay,
+                    self._flash_cycle_score_text(),
+                )
+            )
+            self._emit_log(
+                "周期升级：%.1fs 后开始第 %d/%d 轮 …（累计 %s）"
+                % (
+                    delay,
+                    self._flash_cycle_index,
+                    self._flash_cycle_total,
+                    self._flash_cycle_score_text(),
+                )
+            )
+            self._cancel_flash_cycle_timer()
+            self._flash_cycle_after_id = self.after(
+                int(delay * 1000), self._continue_flash_cycle_after_delay
+            )
+        else:
+            self._enqueue_flash_round()
+
+    def _continue_flash_cycle_after_delay(self) -> None:
+        self._flash_cycle_after_id = None
+        if not self._flash_cycle_active:
+            self._finish_flash_ui()
+            return
+        if self._flash_cancel.is_set():
+            self._emit_log(
+                "周期升级已中止：计划 %d 轮，%s"
+                % (self._flash_cycle_total, self._flash_cycle_score_text())
+            )
+            self._flash_cycle_active = False
+            self._set_flash_cycle_status("已停：%s" % self._flash_cycle_score_text())
+            self._finish_flash_ui()
+            return
+        self._enqueue_flash_round()
 
     def _start_flash(self) -> None:
         path = self._fw_path.get().strip()
@@ -1611,44 +1909,99 @@ class DoIPTesterApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("配置", "配置无效：\n%s" % exc)
             return
-        if not messagebox.askyesno(
-            "确认", "开始刷写？请确认已选对固件与配置中的地址/格式。"
-        ):
+        self._emit_log(self._describe_effective_uds(cfg))
+
+        count, interval = self._parse_flash_cycle_options()
+        if count > 1:
+            confirm = (
+                "开始周期升级？\n"
+                "次数：%d\n间隔：%.1f s\n"
+                "任一轮失败或中止将停止后续轮次，并统计成功/失败次数。\n"
+                "请确认已选对固件与配置中的地址/格式。"
+                % (count, interval)
+            )
+        else:
+            confirm = "开始刷写？请确认已选对固件与配置中的地址/格式。"
+        if not messagebox.askyesno("确认", confirm):
             return
-        self._flash_cancel.clear()
-        self._flash_btn.configure(state=tk.DISABLED)
-        self._cancel_flash_btn.configure(state=tk.NORMAL)
-        self._prog["value"] = 0
-        self._prog["maximum"] = 1
-        self._v_prog_text.set("0%")
-        self._update_progress_text(0, 1)
-        # 刷写占用 worker 持锁；GUI 定时 3E 无法插队，临时切换为刷写线程内持续 3E 保活
-        self._stop_tp(clear_checkbox=False)
-        self._drop_pending_tp_ticks()
-        self._emit_log("刷写任务已提交，正在准备…")
-        self._enqueue("flash", cfg=cfg, path=path)
+
+        self._cancel_flash_cycle_timer()
+        self._flash_cycle_path = path
+        self._flash_cycle_total = count
+        self._flash_cycle_index = 1
+        self._flash_cycle_ok = 0
+        self._flash_cycle_fail = 0
+        self._flash_cycle_interval_sec = interval
+        self._flash_cycle_active = count > 1
+        self._enqueue_flash_round()
 
     def _cancel_flash(self) -> None:
         self._flash_cancel.set()
-        self._emit_log("已请求中止刷写…")
+        waiting_next = self._flash_cycle_after_id is not None
+        self._cancel_flash_cycle_timer()
+        if self._flash_cycle_active:
+            self._emit_log("已请求中止周期升级…")
+            if waiting_next:
+                # 轮次间隔等待中：没有进行中的 worker 刷写，直接收尾
+                self._flash_cycle_active = False
+                self._emit_log(
+                    "周期升级已中止：计划 %d 轮，%s"
+                    % (self._flash_cycle_total, self._flash_cycle_score_text())
+                )
+                self._set_flash_cycle_status(
+                    "已停：%s" % self._flash_cycle_score_text()
+                )
+                self._finish_flash_ui()
+            # 否则正在刷写一轮，等 worker 报 abort → flash_done 停止周期
+        else:
+            self._emit_log("已请求中止刷写…")
 
     def _flash_reconnect_after_ecu_reset(self, cfg: AppConfig) -> Client:
-        """Post HardReset: 断开、等待、再连；须在持 _uds_lock 的 worker 内调用。"""
+        """
+        后编程等待 PHY 重建（Q/BAIC C230039 图9 步骤 b）：
+        11 01 / DD03 复位后 ECU 掉线，诊断仪需周期发送车辆发现请求确认 PHY 已重建。
+        此处改为在配置的超时窗口内轮询 TCP 连接 + 路由激活，直到设备就绪。
+        须在持 _uds_lock 的 worker 内调用。
+        """
         self._do_disconnect()
         dly = cfg.flash.post_transfer_reconnect_delay_sec
         if dly is None:
             dly = 8.0
-        self._emit_log("后编程: 已断开，等待 ECU 复位 %.1fs …" % float(dly))
+        self._emit_log(
+            "后编程: 已断开，等待 PHY 重建数据连接（总超时 %.1fs，轮询探测中）…"
+            % float(dly)
+        )
         deadline = time.monotonic() + float(dly)
-        while time.monotonic() < deadline:
+        attempt = 0
+        last_exc: Optional[Exception] = None
+        while True:
             if self._flash_cancel.is_set():
                 raise FlashAborted("cancelled during post-reset wait")
-            time.sleep(min(0.25, deadline - time.monotonic()))
-        self._emit_log("后编程: 正在重新路由激活并打开 UDS…")
-        self._do_connect(cfg)
-        if self._uds_client is None:
-            raise RuntimeError("重连后 UDS 客户端未建立")
-        return self._uds_client
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt += 1
+            self._emit_log(
+                "后编程: 第 %d 次探测车辆（剩余 %.0fs）…" % (attempt, remaining)
+            )
+            try:
+                self._do_connect(cfg)
+            except Exception as exc:  # 连接/路由激活失败 → 等下一轮
+                last_exc = exc
+                self._emit_log(
+                    "后编程: 探测未就绪（%s），%.1fs 后重试"
+                    % (exc, min(3.0, remaining))
+                )
+                time.sleep(min(3.0, remaining))
+                continue
+            self._emit_log("后编程: PHY 数据连接已重建（第 %d 次探测成功）" % attempt)
+            if self._uds_client is None:
+                raise RuntimeError("重连后 UDS 客户端未建立")
+            return self._uds_client
+        raise RuntimeError(
+            "后编程: 等待 PHY 重建超时（%.1fs，共 %d 次探测）%s"
+            % (float(dly), attempt, ("，最后错误: %s" % last_exc) if last_exc else "")
+        )
 
     def _do_flash(self, cfg: AppConfig, path: str) -> None:
         self._emit_log("正在准备刷写文件: %s" % path)

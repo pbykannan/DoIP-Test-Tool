@@ -161,6 +161,7 @@ class DoIPSession:
                 connect_timeout=connect_to,
                 socket_read_timeout=sock_to,
                 uds_target_logical_address=uds_tgt,
+                log=self._log,
             )
         except IOError as exc:
             raise ConnectionError(_enrich_doip_error(exc)) from exc
