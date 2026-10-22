@@ -12,8 +12,9 @@ from udsoncan.exceptions import NegativeResponseException
 from udsoncan.client import Client
 
 from doip_tester.config.loader import load_app_config_from_str, parse_hex_bytes
-from doip_tester.config.models import AppConfig
+from doip_tester.config.models import AppConfig, DISCOVERY_MODES
 from doip_tester.doip.session import DoIPSession
+from doip_tester.doip.discovery import discover_entities
 from doip_tester.netinfo import enumerate_ipv4_addresses
 from doip_tester.projects import (
     list_project_names,
@@ -304,8 +305,23 @@ class DoIPTesterApp(tk.Tk):
         )
         self._proj_hint_label.pack(side=tk.LEFT, padx=(8, 0))
 
-        conn_frame = ttk.Frame(toolbar)
-        conn_frame.pack(side=tk.RIGHT)
+        # 第二行：发现/连接/断开独立成行，避免与「本机 IP」挤在同一行把「断开」顶出可视区
+        conn_frame = ttk.Frame(header_frame)
+        conn_frame.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(conn_frame, text="发现方式", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        self._discovery_combo = ttk.Combobox(
+            conn_frame,
+            textvariable=self._discovery_mode,
+            values=list(DISCOVERY_MODES),
+            width=10,
+            state="readonly",
+        )
+        self._discovery_combo.pack(side=tk.LEFT, padx=(4, 2))
+        self._discovery_combo.bind("<<ComboboxSelected>>", self._on_discovery_mode_selected)
+        self._discover_btn = ttk.Button(
+            conn_frame, text="🔍 发现", command=self._discover, state=tk.DISABLED
+        )
+        self._discover_btn.pack(side=tk.LEFT, padx=2)
         self._conn_btn = ttk.Button(conn_frame, text="▶ 连接", command=self._connect)
         self._conn_btn.pack(side=tk.LEFT, padx=2)
         self._disconn_btn = ttk.Button(
@@ -314,6 +330,7 @@ class DoIPTesterApp(tk.Tk):
         self._disconn_btn.pack(side=tk.LEFT, padx=2)
         self._status = ttk.Label(conn_frame, text="未连接", font=("Segoe UI", 8))
         self._status.pack(side=tk.LEFT, padx=8)
+        self._update_discover_btn_state()
 
         toolbar.bind("<Configure>", self._on_project_row_resize, add="+")
         self.after(0, self._on_project_row_resize)
@@ -601,6 +618,9 @@ class DoIPTesterApp(tk.Tk):
 
     def _init_config_ui_state(self) -> None:
         self._v_bind = tk.StringVar(value="")
+        self._discovery_mode = tk.StringVar(value="known_ip")
+        self._discovering = False
+        self._discover_seq = 0
         self._addr_mode = tk.StringVar(value="physical")
         self._v_functional_la = tk.StringVar(value="0xE400")
         self._v_manual_hex = tk.StringVar(value="")
@@ -953,8 +973,13 @@ class DoIPTesterApp(tk.Tk):
         )
         self._v_functional_la.set(_fmt_la(cfg.doip.functional_logical_address))
         self._v_bind.set(cfg.network.client_bind_ip or "")
+        mode = (cfg.network.discovery_mode or "known_ip").strip().lower()
+        if mode not in DISCOVERY_MODES:
+            mode = "known_ip"
+        self._discovery_mode.set(mode)
         self._sync_bind_combo_from_bind_var()
         self._on_addr_mode_change()
+        self._update_discover_btn_state()
 
     def _update_addr_effective_hint(self) -> None:
         mode = "功能寻址" if self._addr_mode.get() == "functional" else "物理寻址"
@@ -1132,13 +1157,17 @@ class DoIPTesterApp(tk.Tk):
                             self._status_left.configure(text="⏹ 未连接", foreground=self._theme_hint)
                             self._conn_btn.configure(state=tk.NORMAL)
                             self._disconn_btn.configure(state=tk.DISABLED)
+                        self._update_discover_btn_state()
                         self._update_addr_effective_hint()
                     elif kind == "disconnected":
                         self._status.configure(text="未连接")
                         self._status_left.configure(text="⏹ 未连接", foreground=self._theme_hint)
                         self._conn_btn.configure(state=tk.NORMAL)
                         self._disconn_btn.configure(state=tk.DISABLED)
+                        self._update_discover_btn_state()
                         self._update_addr_effective_hint()
+                    elif kind == "discovered":
+                        self._on_discovered(payload)
                     elif kind == "flash_done":
                         self._on_flash_cycle_done(payload)
                     elif kind == "tp_done":
@@ -1260,13 +1289,17 @@ class DoIPTesterApp(tk.Tk):
         return load_app_config_from_str(self._cfg_text.get("1.0", tk.END))
 
     def _effective_cfg(self) -> AppConfig:
-        """YAML + 顶部「本机 IP」组合框 + 物理/功能寻址。须在 Tk 主线程调用。"""
+        """YAML + 顶部「本机 IP」组合框 + 发现方式 + 物理/功能寻址。须在 Tk 主线程调用。"""
         cfg = self._parse_cfg()
         sel = self._bind_combo.get()
         if sel == "自动" or not sel:
             cfg.network.client_bind_ip = None
         else:
             cfg.network.client_bind_ip = sel.strip()
+        mode = (self._discovery_mode.get() or "known_ip").strip().lower()
+        if mode not in DISCOVERY_MODES:
+            mode = "known_ip"
+        cfg.network.discovery_mode = mode
         cfg.doip.uds_addressing = (
             "functional" if self._addr_mode.get() == "functional" else "physical"
         )
@@ -1555,6 +1588,149 @@ class DoIPTesterApp(tk.Tk):
                 self._ui_queue.put(("disconnected", None))
                 self._emit_log("已断开")
 
+    def _update_discover_btn_state(self) -> None:
+        mode = (self._discovery_mode.get() or "known_ip").strip().lower()
+        enable = mode in ("broadcast", "multicast") and not self._discovering and not self._connecting
+        try:
+            self._discover_btn.configure(state=tk.NORMAL if enable else tk.DISABLED)
+        except Exception:
+            pass
+
+    def _on_discovery_mode_selected(self, _evt: Optional[tk.Event] = None) -> None:
+        self._update_discover_btn_state()
+        mode = (self._discovery_mode.get() or "known_ip").strip().lower()
+        self._patch_yaml_scalar("discovery_mode", mode)
+        self._emit_log("发现方式切换为: %s" % mode)
+
+    @staticmethod
+    def _patch_yaml_key_line(text: str, key: str, value_literal: str) -> str:
+        """Replace or insert a top-level network/doip scalar line; keeps surrounding comments."""
+        import re
+
+        # Prefer replacing an existing key under network: / doip: blocks
+        pattern = re.compile(
+            r"(^[ \t]*%s:[ \t]*).*?([ \t]*(?:#.*)?)$" % re.escape(key),
+            re.M,
+        )
+        if pattern.search(text):
+            return pattern.sub(r"\g<1>%s\g<2>" % value_literal, text, count=1)
+        return text
+
+    def _patch_yaml_scalar(self, key: str, value) -> None:
+        """Update one YAML scalar in the editor text (string quoted, int as 0xHHHH when logical)."""
+        if isinstance(value, str):
+            literal = '"%s"' % value.replace('"', '\\"')
+        elif key == "server_logical_address":
+            literal = "0x%04X" % (int(value) & 0xFFFF)
+        else:
+            literal = str(value)
+        cur = self._cfg_text.get("1.0", tk.END)
+        new = self._patch_yaml_key_line(cur, key, literal)
+        if new != cur:
+            self._cfg_text.delete("1.0", tk.END)
+            self._cfg_text.insert("1.0", new.rstrip("\n") + "\n")
+
+    def _apply_discovery_result(self, ip: str, logical_address: int) -> None:
+        self._patch_yaml_scalar("host", ip)
+        self._patch_yaml_scalar("server_logical_address", logical_address)
+        try:
+            cfg = self._parse_cfg()
+            self._sync_ui_from_cfg(cfg)
+            self._rebuild_preset_tree(cfg)
+        except Exception as exc:
+            self._emit_log("发现结果已写回 YAML，但重新解析失败: %s" % exc)
+
+    def _on_discovered(self, payload: Any) -> None:
+        self._discovering = False
+        self._update_discover_btn_state()
+        if not isinstance(payload, dict):
+            return
+        if not payload.get("ok"):
+            err = payload.get("error") or "未发现 ECU"
+            self._emit_log("发现失败: %s" % err)
+            messagebox.showwarning("发现", str(err))
+            return
+        entities = payload.get("entities") or []
+        if not entities:
+            self._emit_log("发现超时：未收到 Vehicle Announcement / Identification Response")
+            messagebox.showinfo("发现", "未发现 ECU。请确认：\n"
+                                 "1) TBOX 已启动且组播/广播配置正确\n"
+                                 "2) 「本机 IP」选了直连网卡\n"
+                                 "3) Windows 防火墙已放行 UDP 13400")
+            return
+        # Use first entity; log all
+        first = entities[0]
+        ip = first.get("ip")
+        la = int(first.get("logical_address", 0)) & 0xFFFF
+        self._apply_discovery_result(ip, la)
+        self._emit_log(
+            "已用发现结果回填: host=%s server_logical_address=0x%04X（共 %d 台）"
+            % (ip, la, len(entities))
+        )
+        messagebox.showinfo(
+            "发现",
+            "发现 %d 台 ECU，已回填第一台:\nIP=%s\n逻辑地址=0x%04X\n\n可直接点「连接」。"
+            % (len(entities), ip, la),
+        )
+
+    def _discover(self) -> None:
+        if self._discovering or self._connecting:
+            return
+        mode = (self._discovery_mode.get() or "known_ip").strip().lower()
+        if mode == "known_ip":
+            messagebox.showinfo("发现", "当前为「known_ip」模式，请改为 broadcast 或 multicast 后再发现。")
+            return
+        try:
+            cfg = self._effective_cfg()
+        except Exception as exc:
+            messagebox.showerror("配置", "配置无效: %s" % exc)
+            return
+        if mode == "multicast" and not cfg.network.client_bind_ip:
+            messagebox.showerror(
+                "发现",
+                "组播发现需要先在顶部选择「本机 IP」（直连 TBOX 的那块网卡地址）。",
+            )
+            return
+
+        self._discovering = True
+        self._discover_seq += 1
+        seq = self._discover_seq
+        self._update_discover_btn_state()
+        self._emit_log("开始 DoIP 发现 (%s)…" % mode)
+
+        def run_discover(this_seq: int, discover_cfg: AppConfig) -> None:
+            try:
+                entities = discover_entities(
+                    discover_cfg.network.discovery_mode,
+                    udp_port=int(discover_cfg.network.udp_port),
+                    protocol_version=int(discover_cfg.doip.protocol_version),
+                    bind_ip=discover_cfg.network.client_bind_ip,
+                    multicast_address=discover_cfg.network.multicast_address,
+                    timeout=float(discover_cfg.doip.socket_read_timeout or 5.0),
+                    log=self._emit_log,
+                )
+                payload = {
+                    "ok": True,
+                    "entities": [
+                        {
+                            "ip": e.ip,
+                            "port": e.port,
+                            "logical_address": e.logical_address,
+                            "vin": e.vin,
+                        }
+                        for e in entities
+                    ],
+                }
+            except Exception as exc:
+                payload = {"ok": False, "error": str(exc), "entities": []}
+            if this_seq != self._discover_seq:
+                return
+            self._ui_queue.put(("discovered", payload))
+
+        threading.Thread(
+            target=run_discover, args=(seq, cfg), daemon=True
+        ).start()
+
     def _connect(self) -> None:
         if self._disconnecting:
             self._emit_log("正在断开中，请稍后再连接。")
@@ -1571,6 +1747,7 @@ class DoIPTesterApp(tk.Tk):
         seq = self._connect_seq
         self._stop_tp()
         self._clear_pending_cmd_queue()
+        self._update_discover_btn_state()
         self._conn_btn.configure(state=tk.DISABLED)
         # 连接阶段也允许点「断开」来中止卡住的连接流程
         self._disconn_btn.configure(state=tk.NORMAL)
@@ -1653,8 +1830,9 @@ class DoIPTesterApp(tk.Tk):
     def _browse_fw(self) -> None:
         p = filedialog.askopenfilename(
             filetypes=[
-                ("DoIP Package zip (内含s19+xml+zip)", "*.zip"),
-                ("S19/ZIP/XML (v515)", "*.s19;*.zip;*.xml"),
+                ("DoIP Package zip (s19+xml+zip/tar)", "*.zip"),
+                ("S19/ZIP/XML (v515/n80ks/B50-5G)", "*.s19;*.zip;*.xml"),
+                ("S19/TAR/XML (B40L/v335/B50-4G)", "*.s19;*.tar;*.xml"),
                 ("CBF/RSA Package", "*.cbf;*.rsa"),
                 ("Binary", "*.bin;*.hex"),
                 ("All", "*.*"),

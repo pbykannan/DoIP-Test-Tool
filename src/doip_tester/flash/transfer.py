@@ -4,7 +4,8 @@
 - doip_callback.c：Programming(0x02) 仅能从 Extended(0x03) 或 Programming 进入；从 Default
   直切 Programming 会 NRC 0x7E。故典型顺序为 Extended →（扩展会话内 31/85/28 等）→ Programming。
   若对端会话编号为「0=default / 2=extended / 1=programming」则须在 **请求 10 02 前先有 03**；
-  刷写结束前重新进编程会话时按 **Default(01) → Extended(03) → Programming(02)** 执行。
+  刷写结束后重申会话默认 **Default→Extended→Programming**（奇瑞 v116）；
+  北汽 N80/335 在 YAML 设 ``post_transfer_session_reassert: none``（图8：37 后直接 checkMemory）。
 - DOIP_UDS examples/main-client.c 的 `full`：ext → prog → security → 再 38/34 等。
 
 默认刷写前奏（配置里会话/解锁列表为空时自动采用）：
@@ -312,6 +313,21 @@ def _ensure_session(client: Client, mode: str, log: LogFn, state: FlashFlowState
     state.active_security_level = None
 
 
+# 数据传输结束后、后处理前重申编程会话的路径（见 flash.post_transfer_session_reassert）
+_REASSERT_DEFAULT_EXTENDED_PROGRAMMING = "default_extended_programming"
+_REASSERT_EXTENDED_PROGRAMMING = "extended_programming"
+_REASSERT_PROGRAMMING = "programming"
+_REASSERT_NONE = "none"
+_VALID_POST_TRANSFER_SESSION_REASSERT = frozenset(
+    {
+        _REASSERT_DEFAULT_EXTENDED_PROGRAMMING,
+        _REASSERT_EXTENDED_PROGRAMMING,
+        _REASSERT_PROGRAMMING,
+        _REASSERT_NONE,
+    }
+)
+
+
 def _ensure_programming_via_default_extended(
     client: Client, log: LogFn, state: FlashFlowState
 ) -> None:
@@ -322,6 +338,47 @@ def _ensure_programming_via_default_extended(
     _ensure_session(client, "default", log, state)
     _ensure_session(client, "extended", log, state)
     _ensure_session(client, "programming", log, state)
+
+
+def _normalize_post_transfer_session_reassert(mode: Optional[str]) -> str:
+    m = (mode or _REASSERT_DEFAULT_EXTENDED_PROGRAMMING).strip().lower()
+    if m not in _VALID_POST_TRANSFER_SESSION_REASSERT:
+        raise ValueError(
+            "flash.post_transfer_session_reassert 未知: %r（允许: %s）"
+            % (mode, ", ".join(sorted(_VALID_POST_TRANSFER_SESSION_REASSERT)))
+        )
+    return m
+
+
+def _post_transfer_session_reassert_label(mode: str) -> str:
+    return {
+        _REASSERT_NONE: "none（保持当前会话）",
+        _REASSERT_PROGRAMMING: "programming(02)",
+        _REASSERT_EXTENDED_PROGRAMMING: "extended(03)→programming(02)",
+        _REASSERT_DEFAULT_EXTENDED_PROGRAMMING: (
+            "default(01)→extended(03)→programming(02)"
+        ),
+    }[mode]
+
+
+def _apply_post_transfer_session_reassert(
+    client: Client, log: LogFn, state: FlashFlowState, mode: str
+) -> None:
+    """
+    按配置重申会话。
+    V335：勿走 default——10 01 会清掉 0203 预编程条件缓存，随后 10 02 车速检查失败。
+    """
+    m = _normalize_post_transfer_session_reassert(mode)
+    if m == _REASSERT_NONE:
+        return
+    if m == _REASSERT_PROGRAMMING:
+        _ensure_session(client, "programming", log, state)
+        return
+    if m == _REASSERT_EXTENDED_PROGRAMMING:
+        _ensure_session(client, "extended", log, state)
+        _ensure_session(client, "programming", log, state)
+        return
+    _ensure_programming_via_default_extended(client, log, state)
 
 
 def _normalize_flash_security_levels(levels: Sequence[int]) -> List[int]:
@@ -420,22 +477,32 @@ def _reassert_programming_session_and_unlock(
     log: LogFn,
     reason: str,
     l1_to_l3_delay_sec: float,
+    session_reassert: str = _REASSERT_DEFAULT_EXTENDED_PROGRAMMING,
 ) -> None:
     """
-    清除 FlashFlowState 会话假定后经 **Default→Extended→Programming** 再回到编程会话，再重温 SecurityAccess。
+    按 ``session_reassert`` 在长传输/例程边界对齐会话与安全访问。
 
-    仅用「本端 state」无法在长期例程后反映对端真实会话：若认为已是 programming，
-    ``_ensure_session`` 会直接 return、不下发 10 02；后继 FF01 等可能 NRC **0x31** 等与
-    「RequestOutOfRange / 会话或条件不符」混在一起的问题。在长例程边界（例如 37 后、
-    DD02 后）强制执行本函数与刷写链路对齐；会话按 **default→extended→programming**；
-    结束前发 TesterPresent(3E80) 刷新 S3。
+    默认 ``default_extended_programming``（奇瑞 v116：01→03→02 并重温 27）。
+    北汽 N80/335 图8：YAML 设 ``none``——37 后保持 programming，直接 checkMemory，
+    不切 10 xx、不重温 27。结束前发 TesterPresent(3E80) 刷新 S3。
     """
+    mode = _normalize_post_transfer_session_reassert(session_reassert)
+    path_desc = _post_transfer_session_reassert_label(mode)
+    if mode == _REASSERT_NONE:
+        # 图8：保持编程会话与已解锁状态，直接进入后处理例程
+        state.current_session = "programming"
+        log(
+            "刷写会话同步: %s — %s（图8：37 后直接 checkMemory）"
+            % (reason, path_desc)
+        )
+        _flash_tester_present_optional(
+            client, log, "%s — 保持 programming，刷新 S3" % reason
+        )
+        return
+
     state.current_session = None
-    log(
-        "刷写会话同步: %s — 路径 default(01)→extended(03)→programming(02)，再重温 27 …"
-        % reason
-    )
-    _ensure_programming_via_default_extended(client, log, state)
+    log("刷写会话同步: %s — 路径 %s，再重温 27 …" % (reason, path_desc))
+    _apply_post_transfer_session_reassert(client, log, state, mode)
     _apply_flash_security_levels(
         client,
         sec_levels,
@@ -448,7 +515,7 @@ def _reassert_programming_session_and_unlock(
     _flash_tester_present_optional(
         client,
         log,
-        "%s — 会话 01→03→02 与 SecurityAccess 后刷新 S3" % reason,
+        "%s — 会话重申(%s)与 SecurityAccess 后刷新 S3" % (reason, path_desc),
     )
 
 
@@ -810,52 +877,57 @@ def _find_cbf_rsa_in_directory(path: Path) -> Tuple[Path, Path]:
 
 
 def _s19_zip_transfer_items(
-    s19: Path, zip_file: Path, log: LogFn, xml_path: Optional[Path] = None
+    s19: Path, app_file: Path, log: LogFn, xml_path: Optional[Path] = None
 ) -> Tuple[List[TransferItem], None]:
-    """北汽 v515：34/36/37 依次传输 .s19（先）与 .zip（后），服务端分别保存到
-    /tmp/download.s19 与 /tmp/download.zip；无 DD02 签名。
+    """北汽两文件刷写：34/36/37 先传 .s19，再传第 2 个应用包。
+
+    - v515 / n80ks：第 2 个为 ``.zip``
+    - B40L / v335：第 2 个为 ``.tar``（FOTA tar 原样）
+    行为按所选文件扩展名区分；有 zip 时既有路径不变。
 
     ``xml_path`` 为签名清单（5-*.xml）时，解析其中每个文件的 256 字节 RSA 签名
     并附加到对应 TransferItem，供 31 01 0202 完整性校验使用。
     """
     if not s19.is_file():
         raise FileNotFoundError("S19 文件不存在: %s" % s19)
-    if not zip_file.is_file():
-        raise FileNotFoundError("ZIP 文件不存在: %s" % zip_file)
+    if not app_file.is_file():
+        raise FileNotFoundError("应用包文件不存在: %s" % app_file)
     if xml_path is None:
         raise FileNotFoundError(
-            "未找到签名清单（5-*.xml）: %s。v515 刷写必须提供 S19/ZIP 对应的 RSA 签名文件。"
+            "未找到签名清单（5-*.xml）: %s。北汽刷写必须提供 S19/应用包对应的 RSA 签名文件。"
             % s19.parent
         )
     sig_map = parse_signature_xml(xml_path)
     if not sig_map:
         raise ValueError("签名清单 %s 未解析出任何有效签名（需 256 字节 RSA）" % xml_path)
     s19_sig = _match_signature(sig_map, s19)
-    zip_sig = _match_signature(sig_map, zip_file)
+    app_sig = _match_signature(sig_map, app_file)
     missing = []
     if s19_sig is None:
         missing.append(s19.name)
-    if zip_sig is None:
-        missing.append(zip_file.name)
+    if app_sig is None:
+        missing.append(app_file.name)
     if missing:
         raise ValueError(
             "签名清单 %s 中缺少以下文件的签名: %s" % (xml_path.name, ", ".join(missing))
         )
+    mode = "S19/TAR" if app_file.suffix.lower() == ".tar" else "S19/ZIP"
     log(
-        "刷写准备: S19/ZIP 模式，第1个传输=%s (%d bytes)，签名=%s，第2个传输=%s (%d bytes)，签名=%s"
+        "刷写准备: %s 模式，第1个传输=%s (%d bytes)，签名=%s，第2个传输=%s (%d bytes)，签名=%s"
         % (
+            mode,
             s19.name,
             s19.stat().st_size,
             "256字节(%s...)" % s19_sig[:8].hex().upper(),
-            zip_file.name,
-            zip_file.stat().st_size,
-            "256字节(%s...)" % zip_sig[:8].hex().upper(),
+            app_file.name,
+            app_file.stat().st_size,
+            "256字节(%s...)" % app_sig[:8].hex().upper(),
         )
     )
     return [
         TransferItem(name=s19.name, path=s19, size=s19.stat().st_size, signature=s19_sig),
         TransferItem(
-            name=zip_file.name, path=zip_file, size=zip_file.stat().st_size, signature=zip_sig
+            name=app_file.name, path=app_file, size=app_file.stat().st_size, signature=app_sig
         ),
     ], None
 
@@ -924,37 +996,56 @@ def _pick_sibling_s19_zip(side_path: Path, want_suffix: str) -> Path:
     if len(cands) > 1:
         return max(cands, key=lambda p: p.stat().st_size)
     raise ValueError(
-        "未找到与 %s 配对的 %s 文件（期望同目录存在 .s19 与 .zip）"
+        "未找到与 %s 配对的 %s 文件（期望同目录存在 .s19 与 .zip/.tar）"
         % (side_path.name, want_suffix)
+    )
+
+
+def _pick_sibling_app(side_path: Path) -> Path:
+    """为 .s19 找第 2 个应用包：优先 .zip（n80ks），否则 .tar（B40L）。"""
+    for suffix in (".zip", ".tar"):
+        try:
+            return _pick_sibling_s19_zip(side_path, suffix)
+        except ValueError:
+            continue
+    raise ValueError(
+        "未找到与 %s 配对的应用包（期望同目录存在 .zip 或 .tar）" % side_path.name
     )
 
 
 def _resolve_s19_zip_pair(path: Path) -> Tuple[Path, Path, Optional[Path]]:
     suffix = path.suffix.lower()
     if suffix == ".s19":
-        s19, zip_file = path, _pick_sibling_s19_zip(path, ".zip")
+        s19, app_file = path, _pick_sibling_app(path)
     elif suffix == ".zip":
-        zip_file, s19 = path, _pick_sibling_s19_zip(path, ".s19")
+        app_file, s19 = path, _pick_sibling_s19_zip(path, ".s19")
+    elif suffix == ".tar":
+        app_file, s19 = path, _pick_sibling_s19_zip(path, ".s19")
     else:
-        raise ValueError("请选择 .s19 或 .zip 文件，或包含成对文件的目录: %s" % path)
+        raise ValueError(
+            "请选择 .s19 / .zip / .tar 文件，或包含成对文件的目录: %s" % path
+        )
     xml_path = _find_signature_xml(path.parent)
-    return s19, zip_file, xml_path
+    return s19, app_file, xml_path
 
 
 _EXTRACTED_TEMP_DIRS: List[Path] = []
 
 
 def _is_doip_package(zip_path: Path) -> bool:
-    """判断 zip 是否为外层 DoIP 包：内部同时包含 .s19、.xml、.zip 三类文件。"""
+    """外层 DoIP 包：含 .s19、.xml，且含 .zip（n80ks）或 .tar（B40L）。"""
     try:
         with zipfile.ZipFile(str(zip_path)) as zf:
             lower = [n.lower() for n in zf.namelist()]
     except (zipfile.BadZipFile, OSError):
         return False
+    has_app = any(n.endswith(".zip") for n in lower) or any(
+        n.endswith(".tar") for n in lower
+    )
     return (
         any(n.endswith(".s19") for n in lower)
         and any(n.endswith(".xml") for n in lower)
-        and any(n.endswith(".zip") for n in lower)
+        and has_app
     )
 
 
@@ -976,7 +1067,7 @@ def _cleanup_extracted_dirs() -> None:
 def _locate_s19_zip_xml(
     directory: Path, depth: int = 3
 ) -> Optional[Tuple[Path, Path, Optional[Path]]]:
-    """从目录树中递归定位 s19+zip+签名xml 三件套，最多下探 depth 层。"""
+    """从目录树中递归定位 s19+应用包+签名xml，最多下探 depth 层。"""
     try:
         return _find_s19_zip_in_directory(directory)
     except ValueError:
@@ -994,23 +1085,27 @@ def _locate_s19_zip_xml(
 def _find_s19_zip_in_directory(
     path: Path,
 ) -> Tuple[Path, Path, Optional[Path]]:
+    """目录内找 s19 + 应用包。有 .zip 时优先 zip（n80ks 不变）；否则用 .tar（B40L）。"""
     files = [p for p in path.iterdir() if p.is_file()]
     s19_by_stem = {p.stem: p for p in files if p.suffix.lower() == ".s19"}
     zip_by_stem = {p.stem: p for p in files if p.suffix.lower() == ".zip"}
-    if not s19_by_stem or not zip_by_stem:
-        raise ValueError("目录内需同时包含 .s19 与 .zip 文件: %s" % path)
-    common = sorted(set(s19_by_stem) & set(zip_by_stem))
+    tar_by_stem = {p.stem: p for p in files if p.suffix.lower() == ".tar"}
+    # 优先 zip，避免同目录偶发 .tar 时改变 n80ks 行为
+    app_by_stem = zip_by_stem if zip_by_stem else tar_by_stem
+    if not s19_by_stem or not app_by_stem:
+        raise ValueError("目录内需同时包含 .s19 与 .zip/.tar 文件: %s" % path)
+    common = sorted(set(s19_by_stem) & set(app_by_stem))
     if common:
         if len(common) > 1:
             stem = max(common, key=lambda s: s19_by_stem[s].stat().st_size)
         else:
             stem = common[0]
-        s19, zip_file = s19_by_stem[stem], zip_by_stem[stem]
+        s19, app_file = s19_by_stem[stem], app_by_stem[stem]
     else:
         s19 = max(s19_by_stem.values(), key=lambda p: p.stat().st_size)
-        zip_file = max(zip_by_stem.values(), key=lambda p: p.stat().st_size)
+        app_file = max(app_by_stem.values(), key=lambda p: p.stat().st_size)
     xml_path = _find_signature_xml(path)
-    return s19, zip_file, xml_path
+    return s19, app_file, xml_path
 
 
 def _prepare_transfer_items_from_path(
@@ -1020,10 +1115,10 @@ def _prepare_transfer_items_from_path(
         raise FileNotFoundError("刷写输入不存在: %s" % path)
 
     if path.is_dir():
-        # 优先 S19/ZIP（北汽 v515 两文件模型）；否则 CBF/RSA（奇瑞 v116）。
+        # 优先 S19+ZIP/TAR（北汽）；否则 CBF/RSA（奇瑞 v116）。
         try:
-            s19, zip_file, xml_path = _find_s19_zip_in_directory(path)
-            return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+            s19, app_file, xml_path = _find_s19_zip_in_directory(path)
+            return _s19_zip_transfer_items(s19, app_file, log, xml_path)
         except ValueError:
             pass
         cbf, rsa = _find_cbf_rsa_in_directory(path)
@@ -1031,32 +1126,38 @@ def _prepare_transfer_items_from_path(
 
     suffix = path.suffix.lower()
     if suffix == ".zip":
-        # 优先识别外层 DoIP 包（内含 s19+xml+zip 三件套）→ 解压后定位三件套
+        # 外层 DoIP 包（s19+xml+zip|tar）→ 解压后定位
         if _is_doip_package(path):
-            log("刷写准备: %s 识别为外层 DoIP 包，解压后定位其中 s19/xml/zip 三件套" % path.name)
+            log(
+                "刷写准备: %s 识别为外层 DoIP 包，解压后定位其中 s19/xml/应用包"
+                % path.name
+            )
             extracted = _extract_doip_package(path)
             trio = _locate_s19_zip_xml(extracted)
             if trio is None:
                 raise ValueError(
-                    "外层 DoIP 包内未找到 s19+xml+zip 三件套: %s" % path.name
+                    "外层 DoIP 包内未找到 s19+xml+zip/tar 三件套: %s" % path.name
                 )
-            s19, zip_file, xml_path = trio
-            return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+            s19, app_file, xml_path = trio
+            return _s19_zip_transfer_items(s19, app_file, log, xml_path)
         # 否则视为内层升级包（2-TBX*.zip），同目录配对 s19 与签名
-        s19, zip_file, xml_path = _resolve_s19_zip_pair(path)
-        return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+        s19, app_file, xml_path = _resolve_s19_zip_pair(path)
+        return _s19_zip_transfer_items(s19, app_file, log, xml_path)
     if suffix in (".cbf", ".rsa"):
         cbf, rsa = _resolve_cbf_rsa_pair(path)
         return _cbf_rsa_transfer_items(cbf, rsa, log)
     if suffix == ".s19":
-        s19, zip_file, xml_path = _resolve_s19_zip_pair(path)
-        return _s19_zip_transfer_items(s19, zip_file, log, xml_path)
+        s19, app_file, xml_path = _resolve_s19_zip_pair(path)
+        return _s19_zip_transfer_items(s19, app_file, log, xml_path)
+    if suffix == ".tar":
+        # B40L：选了 2-*.tar，同目录配对 s19 + 5-*.xml
+        s19, app_file, xml_path = _resolve_s19_zip_pair(path)
+        return _s19_zip_transfer_items(s19, app_file, log, xml_path)
     if suffix == ".xml":
-        # 直接选了签名清单：同目录找 1-*.s19 与 2-*.zip
-        s19, zip_file = _pick_sibling_s19_zip(path, ".s19"), _pick_sibling_s19_zip(
-            path, ".zip"
-        )
-        return _s19_zip_transfer_items(s19, zip_file, log, path)
+        # 签名清单：同目录找 s19 + 应用包（优先 zip，其次 tar）
+        s19 = _pick_sibling_s19_zip(path, ".s19")
+        app_file = _pick_sibling_app(path)
+        return _s19_zip_transfer_items(s19, app_file, log, path)
 
     return [TransferItem(name=path.name, path=path, size=path.stat().st_size)], None
 
@@ -1370,6 +1471,12 @@ def _run_flash_download_items(
             log,
             reason="数据传输结束(RequestTransferExit)后",
             l1_to_l3_delay_sec=sec_l1_l3_delay,
+            session_reassert=getattr(
+                fl,
+                "post_transfer_session_reassert",
+                _REASSERT_DEFAULT_EXTENDED_PROGRAMMING,
+            )
+            or _REASSERT_DEFAULT_EXTENDED_PROGRAMMING,
         )
 
     post_steps = list(fl.post_transfer_routines or [])

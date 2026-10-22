@@ -22,7 +22,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-顶部可选择 **项目**（[`project_configs`](project_configs/) 下每个 `.yaml` 即一套参数）。安装包/源码已内置默认模板（如 **`N80.yaml`**、**`qirui.yaml`**），开箱可选项目再微调；也可复制改名自建新项目。**本机 IP** 可从枚举到的网卡地址中选择，写入 `network.client_bind_ip`；点 **刷新网卡** 重新扫描。
+顶部可选择 **项目**（[`project_configs`](project_configs/) 下每个 `.yaml` 即一套参数）。安装包/源码已内置默认模板（**`n80ks.yaml`** 北汽515、**`b50-5g.yaml`** 北汽B50-5G（包同N80/S19+ZIP；刷写例程同335，无FF00/FF01）、**`v335.yaml`** 英纳法V335、**`b50-4g.yaml`** 北汽B50-4G（同335/S19+TAR）、**`qirui.yaml`** 奇瑞），开箱可选项目再微调；也可复制改名自建新项目。顶部 **发现方式** 可选 `known_ip` / `broadcast` / `multicast`（组播默认地址 `239.2.0.1`，见 YAML `network.multicast_address`）；选广播/组播后可点 **「发现」** 回填 ECU IP 与逻辑地址。组播时必须先选对 **本机 IP**。
+
+**本机 IP** 可从枚举到的网卡地址中选择，写入 `network.client_bind_ip`；点 **刷新网卡** 重新扫描。
 
 **升级工具后仍连不上、且日志里是 `proto=0x02`：** 多半是 **exe 同目录里旧的 `project_configs\\*.yaml` 仍写着 `protocol_version: 2`**（首次解压后不会自动覆盖）。请删掉该目录或对应 yaml，再运行一次 exe 会重新解压模板；或在表单「协议版本」改为 **3** 并点「表单→YAML」保存。
 

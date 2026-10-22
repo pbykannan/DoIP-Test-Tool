@@ -72,3 +72,26 @@ C 侧参考客户端为 `examples\main-client.c`，服务端为 `examples\main-s
 ## 7. 其他成品工具（仅对照）
 
 测试同事提供的 `E:\北汽N80\doip-process\调试工具\测试小工具V0.6_12.11.exe` 可作为**黑盒行为参考**（能连上时对比：路由激活、会话、DID、刷写结果）。本仓库无法从 exe 反推实现；若需与之一致，建议用 **Wireshark** 同时抓 C 示例、小工具、本工具三者的 **DoIP/UDS 十六进制** 做差异表，再改 **`project_configs` 项目 YAML** 或扩展代码。
+
+## 8. 组播 / 广播发现（PC ↔ TBOX 直连）
+
+本工具支持三种发现方式（YAML `network.discovery_mode`，界面顶部下拉框）：
+
+| 取值 | 含义 |
+|------|------|
+| `known_ip` | 已知 IP 直连（默认，与改造前一致）；「发现」按钮禁用 |
+| `broadcast` | 向 `255.255.255.255:udp_port` 发 Vehicle Identification Request |
+| `multicast` | 加入并发送到 `network.multicast_address`（默认 `239.2.0.1`） |
+
+**直连（无交换机）可用**：PC 与 TBOX 设同网段静态 IP，网关可留空；组播时顶部「本机 IP」必须选直连网卡。
+
+与 DOIP_UDS 服务端对照：
+
+| 本工具 YAML | DOIP_UDS 服务端 XML |
+|-------------|---------------------|
+| `discovery_mode: multicast` | `multicast_enable: TRUE` |
+| `multicast_address` | `multicast_address` |
+| 顶部「本机 IP」 | `multicast_interface`（TBOX 侧填 TBOX 自己的 IP） |
+
+发现成功后会把第一台 ECU 的 IP / 逻辑地址回填到 YAML 的 `host` / `server_logical_address`，再点「连接」即可。
+

@@ -3,6 +3,9 @@ network:
   host: "172.168.2.30"
   tcp_port: 13400
   udp_port: 13400
+  # DoIP 发现：known_ip=已知 IP 直连；broadcast=UDP 广播；multicast=UDP 组播
+  discovery_mode: "known_ip"
+  multicast_address: "239.2.0.1"
   client_bind_ip: null
 
 doip:

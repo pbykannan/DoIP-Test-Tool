@@ -21,12 +21,21 @@ def _uds_secret_key_16(field: str, raw: Any) -> Optional[bytes]:
     return b
 
 
+# DoIP 发现方式：known_ip=已知 IP 直连；broadcast=UDP 广播；multicast=UDP 组播
+DISCOVERY_MODES = ("known_ip", "broadcast", "multicast")
+DEFAULT_MULTICAST_ADDRESS = "239.2.0.1"
+
+
 @dataclass
 class NetworkConfig:
     host: str
     tcp_port: int = 13400
     udp_port: int = 13400
     client_bind_ip: Optional[str] = None
+    # known_ip | broadcast | multicast；默认 known_ip 保持与改造前一致
+    discovery_mode: str = "known_ip"
+    # IPv4 组播组地址；仅 discovery_mode=multicast 时使用
+    multicast_address: str = DEFAULT_MULTICAST_ADDRESS
 
 
 @dataclass
@@ -127,6 +136,11 @@ class FlashConfig:
     security_access_levels_before_download: List[int] = field(default_factory=list)
     # 34 RequestDownload 前确保的安全级别；null 用代码默认 0x01（v116 用 L1，北汽 v515 用 L3）
     transfer_security_level: Optional[int] = None
+    # 数据传输结束后、后处理前重申会话：
+    # default_extended_programming（默认，奇瑞 v116：01→03→02）
+    # | none（北汽 N80/335 图8：37 后保持 programming，直接 checkMemory）
+    # | programming | extended_programming
+    post_transfer_session_reassert: str = "default_extended_programming"
 
 
 @dataclass
@@ -331,12 +345,24 @@ class AppConfig:
             for x in _raw_sec:
                 _sec_levels.append(int(x))
 
+        _discovery_mode = str(n.get("discovery_mode", "known_ip")).strip().lower()
+        if _discovery_mode not in DISCOVERY_MODES:
+            raise ValueError(
+                "network.discovery_mode must be one of %s, got %r"
+                % (DISCOVERY_MODES, _discovery_mode)
+            )
+        _mc_addr = str(n.get("multicast_address", DEFAULT_MULTICAST_ADDRESS) or DEFAULT_MULTICAST_ADDRESS).strip()
+        if not _mc_addr:
+            _mc_addr = DEFAULT_MULTICAST_ADDRESS
+
         return AppConfig(
             network=NetworkConfig(
                 host=str(n["host"]),
                 tcp_port=int(n.get("tcp_port", 13400)),
                 udp_port=int(n.get("udp_port", 13400)),
                 client_bind_ip=n.get("client_bind_ip"),
+                discovery_mode=_discovery_mode,
+                multicast_address=_mc_addr,
             ),
             doip=DoipConfig(
                 client_logical_address=int(d.get("client_logical_address", 0x0E80)),
@@ -420,5 +446,12 @@ class AppConfig:
                     if fl.get("transfer_security_level") is not None
                     else None
                 ),
+                post_transfer_session_reassert=str(
+                    fl.get(
+                        "post_transfer_session_reassert",
+                        "default_extended_programming",
+                    )
+                    or "default_extended_programming"
+                ).strip().lower(),
             ),
         )

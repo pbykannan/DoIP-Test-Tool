@@ -1,0 +1,6 @@
+LIBRARY BAIC_B50_SeedKey
+EXPORTS
+    GenerateKeyEx
+    GenerateKeyExOpt
+    B50_ComputeKeyWithDF
+    B50_AesCmac

@@ -7,6 +7,9 @@ network:
   host: "192.168.10.43"
   tcp_port: 13400
   udp_port: 13400
+  # DoIP 发现：known_ip=已知 IP 直连；broadcast=UDP 广播；multicast=UDP 组播
+  discovery_mode: "known_ip"
+  multicast_address: "239.2.0.1"
   client_bind_ip: null
 
 doip:
@@ -158,22 +161,23 @@ flash:
   transfer_exit_data: null
   # 34/36/37 需要 Level3（TBX 表：RequestDownload/TransferData/RequestTransferExit = 02 会话 + level_3）
   transfer_security_level: 0x11
-  # Pre-programming（extended 会话内，会话自动先切 10 03）
-  # 依据 Q/BAIC C230039 图7/9.2.2：预编程 (c) 85 02、(d) 28 03 01 使用功能寻址；
-  # 28 03 01 = disableNonDiagnosticCom（controlType=0x03 disableRxAndTx + commType=0x01 NCM），
-  # 注意不是 28 00 03（那是 enable）。功能寻址请求按 suppress 语义（无应答视为成功）。
+  # 图7 预编程（仅 N80/335；跳过 Vehicle Discovery）：
+  # (a) 10 03 功能 → (b) 31 01 0203 物理 → (c) 85 02 功能 → (d) 28 03 01 功能
   pre_transfer_raw_requests:
-    - "31010203"   # (b) checkProgrammingPreconditions（物理寻址，extended 会话）
+    - payload: "1003"       # (a) extendedSession（功能寻址）
+      addressing: functional
+    - "31010203"            # (b) checkProgrammingPreconditions（物理寻址）
     - payload: "8502"       # (c) ControlDTCSetting off（功能寻址）
       addressing: functional
     - payload: "280301"     # (d) CommunicationControl disableNonDiagnosticCom（功能寻址）
       addressing: functional
   pre_transfer_routines: []
-  # Programming session
+  # 图8 (a) 物理 10 02；跳过 (b) Vehicle Discovery（无 bootloader）
   diagnostic_sessions_before_download:
-    - extended
     - programming
-  # L1(UDS因子) 在 extended 会话解锁（TBX 表 27 01/02=03 会话）；L3(BOOT因子) 在编程会话
+  # 图8：37 后保持 programming，直接 0202（勿走 10 01 清 0203 缓存）
+  post_transfer_session_reassert: "none"
+  # L1 在图7 结束后的 extended 内解锁（TBX：27 01/02=03）；L3 在 programming（图8 c）
   security_access_levels_before_download:
     - 0x01
     - 0x11
@@ -196,16 +200,10 @@ flash:
     - routine_id: 0xFF01
       control_type: 1
       data: ""      # 检查编程依赖（服务端直接成功）
-  # 后编程（依据 Q/BAIC C230039 图9 / 9.2.4 完整执行，不复位不结束）：
-  #   (a) 11 01 硬复位触发 OTA 升级
-  #   (b) 等待 PHY 重建数据连接（诊断仪周期发送车辆发现请求，周期 100ms×50 次；工具按
-  #       post_transfer_reconnect_delay_sec 轮询重连直到设备就绪）
-  #   (c) 10 03 扩展会话（功能寻址）
-  #   (d) 28 00 01 恢复网络正常通信（功能寻址）
-  #   (e) 85 01 恢复 DTC 设置（功能寻址）
-  #   (f) 10 01 返回默认会话（功能寻址）
-  #   (g) 14 FF FF FF 清除 DTC（功能寻址）
-  # 功能寻址请求按 suppress 语义处理：无应答视为成功。
+  # 后编程（图9；跳过 (b) Vehicle Discovery）：
+  #   (a) 11 01 硬复位 → 工具按 post_transfer_reconnect_delay_sec 轮询重连
+  #   (c) 10 03 (d) 28 00 01 (e) 85 01 (f) 10 01 (g) 14 FF FF FF（均功能寻址）
+  # 功能寻址按 suppress 语义：无应答视为成功。
   post_transfer_raw_requests:
     - "1101"
   post_transfer_reconnect_delay_sec: 350

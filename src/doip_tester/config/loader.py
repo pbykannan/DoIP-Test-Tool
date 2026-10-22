@@ -52,6 +52,8 @@ def app_config_to_dict(cfg: AppConfig) -> Dict[str, Any]:
         "host": cfg.network.host,
         "tcp_port": cfg.network.tcp_port,
         "udp_port": cfg.network.udp_port,
+        "discovery_mode": cfg.network.discovery_mode,
+        "multicast_address": cfg.network.multicast_address,
     }
     if cfg.network.client_bind_ip:
         net["client_bind_ip"] = cfg.network.client_bind_ip
@@ -189,6 +191,10 @@ def app_config_to_dict(cfg: AppConfig) -> Dict[str, Any]:
         )
     if cfg.flash.transfer_security_level is not None:
         flash["transfer_security_level"] = cfg.flash.transfer_security_level
+    if cfg.flash.post_transfer_session_reassert:
+        flash["post_transfer_session_reassert"] = (
+            cfg.flash.post_transfer_session_reassert
+        )
 
     return {
         "network": net,

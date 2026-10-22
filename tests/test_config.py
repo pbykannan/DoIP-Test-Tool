@@ -70,5 +70,52 @@ flash:
         self.assertEqual(a.diagnostics.dids, b.diagnostics.dids)
 
 
+
+class TestDiscoveryConfig(unittest.TestCase):
+    def test_discovery_defaults_and_roundtrip(self) -> None:
+        y = """
+network:
+  host: "10.0.0.9"
+  tcp_port: 13400
+  udp_port: 13400
+  discovery_mode: "multicast"
+  multicast_address: "239.2.0.1"
+doip:
+  client_logical_address: 0x0E80
+  server_logical_address: 0x002B
+  protocol_version: 3
+  activation_type: Default
+uds: {}
+diagnostics:
+  dids: []
+flash:
+  memory_address: 0
+  address_format: 32
+  memorysize_format: 32
+"""
+        cfg = load_app_config_from_str(y)
+        self.assertEqual(cfg.network.discovery_mode, "multicast")
+        self.assertEqual(cfg.network.multicast_address, "239.2.0.1")
+        again = load_app_config_from_str(dump_app_config_yaml(cfg))
+        self.assertEqual(again.network.discovery_mode, "multicast")
+        self.assertEqual(again.network.multicast_address, "239.2.0.1")
+
+    def test_invalid_discovery_mode(self) -> None:
+        y = """
+network:
+  host: "10.0.0.9"
+  discovery_mode: "foo"
+doip:
+  client_logical_address: 1
+  server_logical_address: 1
+uds: {}
+diagnostics: {}
+flash:
+  memory_address: 0
+"""
+        with self.assertRaises(ValueError):
+            load_app_config_from_str(y)
+
+
 if __name__ == "__main__":
     unittest.main()
